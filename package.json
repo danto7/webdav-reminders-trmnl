@@ -1,0 +1,19 @@
+{
+  "name": "webdav-reminders-trmnl",
+  "version": "1.0.0",
+  "description": "",
+  "main": "render.js",
+  "scripts": {
+    "render": "node render.js",
+    "demo": "node render.js --demo example.png"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@napi-rs/canvas": "^1.0.9",
+    "fast-xml-parser": "^5.11.2",
+    "ical.js": "^2.2.1"
+  }
+}
