@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Fetch reminders (VTODOs) from a CalDAV/WebDAV server and render them as an
+// Fetch reminders (VTODOs) and today's events (VEVENTs) from a CalDAV server and render them as an
 // 800x480 1-bit kanban board for a TRMNL e-ink display.
 //
 // Config via environment:
@@ -11,8 +11,11 @@
 //   SHOW_COMPLETED   status mode: "0" hides the Done (completed today) column; list mode: "1" includes completed
 //   FONT_PATH        TTF/OTF to use instead of the bundled fonts/DejaVuSans.ttf
 //   FONT_BOLD_PATH   bold variant (default: bundled DejaVuSans-Bold.ttf, or FONT_PATH if set)
+//   FONT_EMOJI_PATH  emoji fallback font (default: bundled monochrome fonts/NotoEmoji.ttf)
 //   LOCALE           BCP 47 locale for dates/times and labels, e.g. de-DE, en-GB (default: de-DE;
 //                    labels exist for de and en, other languages fall back to en)
+//   SHOW_EVENTS      "0" disables today's calendar events in the Today column (default: shown)
+//   EVENT_CALENDARS  comma-separated calendar names to take events from (default: all)
 //   WEBHOOK_URL      if set, POST the rendered PNG to this URL (raw body, image/png)
 //
 // Usage: node render.js               (POST to WEBHOOK_URL if set, else write reminders.png)
@@ -38,18 +41,22 @@ const STRINGS = {
     header: 'Erinnerungen', todo: 'Zu erledigen', today: 'Heute', done: 'Erledigt',
     tomorrow: 'Morgen', yesterday: 'Gestern', more: (n) => `+ ${n} weitere`,
     empty: 'Nichts zu tun', noLists: 'Keine Erinnerungslisten gefunden', untitled: '(ohne Titel)',
+    allDay: 'Ganztägig',
   },
   en: {
     header: 'Reminders', todo: 'To Do', today: 'Today', done: 'Done',
     tomorrow: 'Tomorrow', yesterday: 'Yesterday', more: (n) => `+ ${n} more`,
     empty: 'Nothing here', noLists: 'No reminder lists found', untitled: '(untitled)',
+    allDay: 'All day',
   },
 };
 const T = STRINGS[LOCALE.split(/[-_]/)[0].toLowerCase()] ?? STRINGS.en;
 
 // ---------------------------------------------------------------- CalDAV ----
 
-const xml = new XMLParser({ removeNSPrefix: true, ignoreAttributes: false, isArray: (n) => n === 'response' || n === 'propstat' || n === 'comp' });
+// htmlEntities decodes numeric character references: Nextcloud sends the CRLF line
+// endings inside calendar-data as '&#13;', which would otherwise corrupt every value.
+const xml = new XMLParser({ removeNSPrefix: true, ignoreAttributes: false, htmlEntities: true, isArray: (n) => n === 'response' || n === 'propstat' || n === 'comp' });
 
 function authHeader() {
   const { CALDAV_USER: u, CALDAV_PASSWORD: p } = process.env;
@@ -98,6 +105,8 @@ async function fetchCalendarData(list) {
   return responses.map((r) => text(okProp(r)['calendar-data'])).filter(Boolean);
 }
 
+const cleanTitle = (s) => (s || '').replace(/\s+/g, ' ').trim() || T.untitled;
+
 // iOS Reminders stores "remind me at a location" on the alarm as
 // X-APPLE-STRUCTURED-LOCATION / X-APPLE-PROXIMITY; other clients may use LOCATION.
 function hasLocation(vtodo) {
@@ -118,7 +127,7 @@ async function fetchTodos(list) {
       const status = (vtodo.getFirstPropertyValue('status') || '').toUpperCase();
       const completed = status === 'COMPLETED' || vtodo.hasProperty('completed');
       todos.push({
-        title: vtodo.getFirstPropertyValue('summary') || T.untitled,
+        title: cleanTitle(vtodo.getFirstPropertyValue('summary')),
         list: list.name,
         status: completed ? 'COMPLETED' : status === 'IN-PROCESS' ? 'IN-PROCESS' : 'NEEDS-ACTION',
         due: due ? due.toJSDate() : null,
@@ -130,6 +139,104 @@ async function fetchTodos(list) {
     }
   }
   return todos;
+}
+
+// ---------------------------------------------------------------- Events ----
+
+// CALDAV_URL may point at a single task list, so find the account's calendar
+// home via the standard principal lookup (RFC 5397 / RFC 4791 §6.2.1).
+async function discoverCalendarHome(baseUrl) {
+  const [who] = await dav('PROPFIND', baseUrl, 0, `<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>`);
+  const principal = text(okProp(who ?? {})['current-user-principal']?.href);
+  if (!principal) throw new Error('server did not report current-user-principal');
+  const [p] = await dav('PROPFIND', new URL(principal, baseUrl).toString(), 0, `<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><c:calendar-home-set/></d:prop></d:propfind>`);
+  const home = text(okProp(p ?? {})['calendar-home-set']?.href);
+  if (!home) throw new Error('server did not report calendar-home-set');
+  return new URL(home, baseUrl).toString();
+}
+
+// Every calendar in the home that can hold events, including subscriptions
+// (Nextcloud serves cached webcal subscriptions, e.g. holidays, as "subscribed").
+async function discoverEventCalendars(homeUrl) {
+  const responses = await dav('PROPFIND', homeUrl, 1, `<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:resourcetype/><d:displayname/><c:supported-calendar-component-set/></d:prop>
+</d:propfind>`);
+  const only = process.env.EVENT_CALENDARS?.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const cals = [];
+  for (const r of responses) {
+    const prop = okProp(r);
+    const rt = prop.resourcetype;
+    if (!rt || !('calendar' in rt || 'subscribed' in rt) || 'deleted-calendar' in rt) continue;
+    const comps = prop['supported-calendar-component-set']?.comp;
+    if (comps && !comps.some((c) => c['@_name'] === 'VEVENT')) continue;
+    const url = new URL(r.href, homeUrl).toString();
+    const name = text(prop.displayname) || decodeURIComponent(url.replace(/\/$/, '').split('/').pop());
+    if (only && !only.includes(name.toLowerCase())) continue;
+    cals.push({ url, name });
+  }
+  return cals;
+}
+
+// iCalendar UTC timestamp, e.g. 20260929T220000Z.
+const icalUtc = (d) => d.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+
+// Events overlapping [start, end). The server expands recurring events into
+// the individual instances (in UTC) for that range.
+async function fetchEvents(cal, start, end) {
+  const range = `start="${icalUtc(start)}" end="${icalUtc(end)}"`;
+  const responses = await dav('REPORT', cal.url, 1, `<?xml version="1.0"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><c:calendar-data><c:expand ${range}/></c:calendar-data></d:prop>
+  <c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:time-range ${range}/></c:comp-filter></c:comp-filter></c:filter>
+</c:calendar-query>`);
+  const events = [];
+  for (const r of responses) {
+    const data = text(okProp(r)['calendar-data']);
+    if (!data) continue;
+    const vcal = new ICAL.Component(ICAL.parse(data));
+    for (const vevent of vcal.getAllSubcomponents('vevent')) {
+      if ((vevent.getFirstPropertyValue('status') || '').toUpperCase() === 'CANCELLED') continue;
+      const ev = new ICAL.Event(vevent);
+      const s = ev.startDate.toJSDate();
+      const e = ev.endDate ? ev.endDate.toJSDate() : s;
+      if (!(s < end && (e > start || +e === +s))) continue; // server filters too, but be strict
+      events.push({
+        kind: 'event',
+        title: cleanTitle(vevent.getFirstPropertyValue('summary')),
+        list: cal.name,
+        start: s,
+        end: e,
+        allDay: ev.startDate.isDate,
+        recurring: vevent.hasProperty('recurrence-id') || vevent.hasProperty('rrule'),
+      });
+    }
+  }
+  return events;
+}
+
+async function loadTodaysEvents() {
+  if (process.env.SHOW_EVENTS === '0') return [];
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+  try {
+    const cals = await discoverEventCalendars(await discoverCalendarHome(process.env.CALDAV_URL));
+    const results = await Promise.all(
+      cals.map((cal) => fetchEvents(cal, start, end).catch((err) => {
+        console.error(`Skipping calendar "${cal.name}": ${err.message}`);
+        return [];
+      })),
+    );
+    return results.flat();
+  } catch (err) {
+    // Events are an extra; never let them break the reminders board.
+    console.error(`Could not load calendar events: ${err.message}`);
+    return [];
+  }
 }
 
 async function discoverOrFallback() {
@@ -150,8 +257,8 @@ async function dumpReminders() {
 
 async function loadReminders() {
   const lists = await discoverOrFallback();
-  const all = await Promise.all(lists.map(fetchTodos));
-  return { lists: lists.map((l) => l.name), todos: all.flat() };
+  const [all, events] = await Promise.all([Promise.all(lists.map(fetchTodos)), loadTodaysEvents()]);
+  return { lists: lists.map((l) => l.name), todos: all.flat(), events };
 }
 
 function demoReminders() {
@@ -161,7 +268,7 @@ function demoReminders() {
     t('Stromrechnung bezahlen', 'Zuhause', 'NEEDS-ACTION', d(-1), { priority: 1, recurring: true }),
     t('Zahnarzttermin buchen', 'Zuhause', 'NEEDS-ACTION', d(0, 15)),
     t('Geburtstagsgeschenk für Anna kaufen – etwas mit Büchern oder ein schönes Stifteset', 'Zuhause', 'NEEDS-ACTION', d(3)),
-    t('Pflanzen gießen', 'Zuhause', 'NEEDS-ACTION', null, { recurring: true }),
+    t('🌱 Pflanzen gießen', 'Zuhause', 'NEEDS-ACTION', null, { recurring: true }),
     t('Reisepass verlängern', 'Besorgungen', 'NEEDS-ACTION', d(14)),
     t('Reinigung abholen', 'Besorgungen', 'NEEDS-ACTION', d(1)),
     t('Quartalsbericht schreiben', 'Arbeit', 'IN-PROCESS', d(2), { priority: 1 }),
@@ -170,7 +277,13 @@ function demoReminders() {
     t('Neuen Toner bestellen', 'Arbeit', 'COMPLETED', null, { completedAt: d(0) }),
     t('Vermieter anrufen', 'Zuhause', 'COMPLETED', null, { completedAt: d(-1) }),
   ];
-  return { lists: ['Zuhause', 'Besorgungen', 'Arbeit'], todos };
+  const e = (title, list, start, end, extra = {}) => ({ kind: 'event', title, list, start, end, allDay: false, recurring: false, ...extra });
+  const events = [
+    e('Tag der Deutschen Einheit', 'Feiertage', d(0, 0), d(1, 0), { allDay: true }),
+    e('Team-Standup', 'Persönlich', d(0, 9), d(0, 10), { recurring: true }),
+    e('🎂 Lena (1990)', 'Geburtstage', d(0, 0), d(1, 0), { allDay: true, recurring: true }),
+  ];
+  return { lists: ['Zuhause', 'Besorgungen', 'Arbeit'], todos, events };
 }
 
 // ------------------------------------------------------------- Grouping ----
@@ -184,7 +297,7 @@ function byUrgency(a, b) {
   return a.title.localeCompare(b.title);
 }
 
-function buildColumns({ lists, todos }) {
+function buildColumns({ lists, todos, events = [] }) {
   const mode = (process.env.GROUP_BY || 'status').toLowerCase();
   if (mode === 'list') {
     const showDone = process.env.SHOW_COMPLETED === '1';
@@ -203,7 +316,14 @@ function buildColumns({ lists, todos }) {
   const cols = [
     // Undated reminders first, then by due date.
     { title: T.todo, items: open.filter((t) => !dueToday(t)).sort((a, b) => !!a.due - !!b.due || byUrgency(a, b)) },
-    { title: T.today, items: open.filter(dueToday).sort(byUrgency) },
+    {
+      title: T.today,
+      // Today's calendar events (all-day first, then by start time), then reminders.
+      items: [
+        ...[...events].sort((a, b) => b.allDay - a.allDay || a.start - b.start || a.title.localeCompare(b.title)),
+        ...open.filter(dueToday).sort(byUrgency),
+      ],
+    },
   ];
   if (process.env.SHOW_COMPLETED !== '0') {
     cols.push({
@@ -226,10 +346,15 @@ const FONT_DIR = fileURLToPath(new URL('./fonts/', import.meta.url));
 function registerFonts() {
   const regular = process.env.FONT_PATH || join(FONT_DIR, 'DejaVuSans.ttf');
   const bold = process.env.FONT_BOLD_PATH || (process.env.FONT_PATH ? regular : join(FONT_DIR, 'DejaVuSans-Bold.ttf'));
-  for (const path of new Set([regular, bold])) {
-    if (!GlobalFonts.registerFromPath(path, 'Board')) throw new Error(`Could not load font ${path}`);
-  }
-  return 'Board';
+  const emoji = process.env.FONT_EMOJI_PATH || join(FONT_DIR, 'NotoEmoji.ttf');
+  const load = (path, family) => {
+    if (!GlobalFonts.registerFromPath(path, family)) throw new Error(`Could not load font ${path}`);
+  };
+  for (const path of new Set([regular, bold])) load(path, 'Board');
+  // Monochrome Noto Emoji as fallback, so emoji (e.g. Nextcloud's 🎂 birthdays)
+  // render as black-and-white glyphs instead of blanks.
+  load(emoji, 'BoardEmoji');
+  return 'Board, BoardEmoji';
 }
 
 function wrap(ctx, str, maxWidth, maxLines) {
@@ -273,6 +398,13 @@ function formatDue(t, now) {
   return { label: label + time, overdue: t.status !== 'COMPLETED' && (t.dueHasTime ? t.due < now : diff < 0) };
 }
 
+// "09:00–10:30" for timed events, "Ganztägig"/"All day" for all-day ones.
+function formatEventTime(ev) {
+  if (ev.allDay) return T.allDay;
+  const hm = (d) => d.toLocaleTimeString(LOCALE, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  return +ev.end > +ev.start ? `${hm(ev.start)}–${hm(ev.end)}` : hm(ev.start);
+}
+
 // Small "repeats" icon (two arrows chasing each other), 13x12px with its top-left at (ox, oy).
 function drawRepeatIcon(ctx, ox, oy, color) {
   const seg = (pts) => {
@@ -300,7 +432,11 @@ function render(columns, font) {
 
   ctx.fillStyle = WHITE;
   ctx.fillRect(0, 0, WIDTH, HEIGHT);
-  ctx.textBaseline = 'top';
+  // Draw text with its top edge at y. Positioning from the text font's ascent
+  // (instead of textBaseline 'top') keeps lines aligned when they start with an
+  // emoji, whose fallback font has different metrics.
+  ctx.textBaseline = 'alphabetic';
+  const drawText = (str, tx, ty) => ctx.fillText(str, tx, ty + ctx.measureText('Hg').fontBoundingBoxAscent);
 
   // Header bar
   const headerH = 34;
@@ -308,15 +444,15 @@ function render(columns, font) {
   ctx.fillRect(0, 0, WIDTH, headerH);
   ctx.fillStyle = WHITE;
   ctx.font = `bold 20px ${font}`;
-  ctx.fillText(T.header, M, 7);
+  drawText(T.header, M, 7);
   ctx.font = `15px ${font}`;
   const stamp = now.toLocaleString(LOCALE, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
-  ctx.fillText(stamp, WIDTH - M - ctx.measureText(stamp).width, 10);
+  drawText(stamp, WIDTH - M - ctx.measureText(stamp).width, 10);
 
   if (!columns.length) {
     ctx.fillStyle = BLACK;
     ctx.font = `18px ${font}`;
-    ctx.fillText(T.noLists, M, headerH + 20);
+    drawText(T.noLists, M, headerH + 20);
     return canvas;
   }
 
@@ -335,7 +471,7 @@ function render(columns, font) {
     ctx.strokeRect(x + 1, top + 1, colW - 2, colH - 2);
     ctx.fillStyle = BLACK;
     ctx.font = `bold 16px ${font}`;
-    ctx.fillText(col.title, x + 8, top + 8);
+    drawText(col.title, x + 8, top + 8);
     const count = String(col.items.length);
     ctx.font = `bold 13px ${font}`;
     const cw = Math.max(22, ctx.measureText(count).width + 12);
@@ -343,7 +479,7 @@ function render(columns, font) {
     ctx.roundRect(x + colW - cw - 8, top + 7, cw, 20, 10);
     ctx.fill();
     ctx.fillStyle = WHITE;
-    ctx.fillText(count, x + colW - 8 - cw / 2 - ctx.measureText(count).width / 2, top + 10);
+    drawText(count, x + colW - 8 - cw / 2 - ctx.measureText(count).width / 2, top + 10);
     ctx.fillStyle = BLACK;
     ctx.fillRect(x + 6, top + 32, colW - 12, 2);
 
@@ -356,16 +492,18 @@ function render(columns, font) {
     for (let i = 0; i < col.items.length; i++) {
       const t = col.items[i];
       const remaining = col.items.length - i;
+      const isEvent = t.kind === 'event';
       ctx.font = `15px ${font}`;
-      const lines = wrap(ctx, t.title, cardW - 2 * pad - (t.priority && t.priority <= 4 ? 12 : 0), 3);
-      const due = formatDue(t, now);
-      const meta = [due?.label, process.env.GROUP_BY === 'list' ? null : t.list].filter(Boolean);
+      const lines = wrap(ctx, t.title, cardW - 2 * pad - (t.priority && t.priority <= 4 ? 12 : 0) - (isEvent ? 4 : 0), 3);
+      const due = isEvent ? null : formatDue(t, now);
+      const when = isEvent ? formatEventTime(t) : due?.label;
+      const meta = [when, process.env.GROUP_BY === 'list' ? null : t.list].filter(Boolean);
       const hasMeta = meta.length > 0 || t.recurring;
       const h = pad * 2 + lines.length * lineH + (hasMeta ? 16 : 0);
       const limit = remaining > 1 ? bottom - moreH : bottom;
       if (y + h > limit) {
         ctx.font = `bold 13px ${font}`;
-        ctx.fillText(T.more(remaining), cardX + 2, y + 2);
+        drawText(T.more(remaining), cardX + 2, y + 2);
         break;
       }
 
@@ -378,18 +516,26 @@ function render(columns, font) {
       const fg = inverted ? WHITE : BLACK;
       ctx.fillStyle = fg;
 
-      // High priority marker
+      // Calendar events get a solid bar on the left edge.
       let tx = cardX + pad;
+      if (isEvent) {
+        ctx.beginPath();
+        ctx.roundRect(cardX, y, 6, h, [5, 0, 0, 5]);
+        ctx.fill();
+        tx += 4;
+      }
+
+      // High priority marker
       if (t.priority && t.priority <= 4) {
         ctx.font = `bold 15px ${font}`;
-        ctx.fillText('!', tx, y + pad);
+        drawText('!', tx, y + pad);
         tx += 12;
       }
 
       ctx.font = `15px ${font}`;
       lines.forEach((ln, li) => {
         const ly = y + pad + li * lineH;
-        ctx.fillText(ln, tx, ly);
+        drawText(ln, tx, ly);
         if (done) {
           const w = ctx.measureText(ln).width;
           ctx.fillRect(tx, ly + 8, w, 1.5);
@@ -398,20 +544,20 @@ function render(columns, font) {
 
       if (hasMeta) {
         const my = y + pad + lines.length * lineH + 1;
-        let mx = cardX + pad;
+        let mx = cardX + pad + (isEvent ? 4 : 0);
         if (t.recurring) {
           drawRepeatIcon(ctx, mx, my + 1, fg);
           mx += 17;
         }
         ctx.font = `bold 12px ${font}`;
-        ctx.fillText(meta.join(' · '), mx, my);
+        drawText(meta.join(' · '), mx, my);
       }
       y += h + 6;
     }
 
     if (!col.items.length) {
       ctx.font = `bold 13px ${font}`;
-      ctx.fillText(T.empty, cardX + 2, y + 2);
+      drawText(T.empty, cardX + 2, y + 2);
     }
   });
 
@@ -472,7 +618,7 @@ async function main() {
 
   if (out) {
     writeFileSync(out, png);
-    console.log(`Wrote ${out} (${WIDTH}x${HEIGHT}, ${data.todos.length} reminders)`);
+    console.log(`Wrote ${out} (${WIDTH}x${HEIGHT}, ${data.todos.length} reminders, ${data.events?.length ?? 0} events today)`);
   }
   if (useWebhook) await postWebhook(webhook, png);
 }
