@@ -16,6 +16,7 @@
 //                    labels exist for de and en, other languages fall back to en)
 //   SHOW_EVENTS      "0" disables calendar events in the Today/Tomorrow columns (default: shown)
 //   EVENT_CALENDARS  comma-separated calendar names to take events from (default: all)
+//   GREETING_NAME    name for the header greeting, e.g. "Daniel" -> "Guten Morgen, Daniel"
 //   WEATHER_LOCATION place name for the weather line in Heute/Morgen, e.g. "Hamburg"
 //   WEATHER_LAT/LON  coordinates instead of WEATHER_LOCATION (no weather if neither is set)
 //   WEBHOOK_URL      if set, POST the rendered PNG to this URL (raw body, image/png)
@@ -44,6 +45,23 @@ const STRINGS = {
     tomorrow: 'Morgen', yesterday: 'Gestern', more: (n) => `+ ${n} weitere`,
     empty: 'Nichts zu tun', noLists: 'Keine Erinnerungslisten gefunden', untitled: '(ohne Titel)',
     allDay: 'Ganztägig',
+    greet: ['Gute Nacht', 'Guten Morgen', 'Guten Tag', 'Guten Abend'],
+    progress: (d, n) => `${d} von ${n} erledigt`,
+    celebrate: { title: 'Alles geschafft!', lines: ['Zeit für Feierabend', 'Gönn dir was Schönes', 'Stark gemacht', 'Der Rest des Tages gehört dir'] },
+    sub: {
+      birthday: (names) => `Heute hat ${names} Geburtstag 🎂`,
+      allDone: ['Alles erledigt – stark! 🎉', 'Liste leer, Kopf frei ✨', 'Heute alles geschafft 💪'],
+      overdue: (n) => n === 1
+        ? ['Eine Sache wartet schon – Schritt für Schritt', 'Nur eine überfällige Aufgabe – du packst das']
+        : [`${n} Sachen warten schon – Schritt für Schritt`, `${n} überfällige Aufgaben – eins nach dem anderen`],
+      free: (wd) => [`Ein freier ${wd} – genieß ihn 🌿`, 'Nichts Dringendes heute – gönn dir was ☕', 'Heute ist nichts fällig – durchatmen 🌿'],
+      weekend: (n) => [`Schönes Wochenende! ${n} ${n === 1 ? 'Aufgabe' : 'Aufgaben'} auf der Liste`, 'Wochenende – mach es dir schön ☀️'],
+      friday: (n) => [`Freitag! Noch ${n} ${n === 1 ? 'Aufgabe' : 'Aufgaben'} bis zum Wochenende 🎈`, 'Endspurt – bald ist Wochenende 🎈'],
+      rainy: (wd, n) => [`Regnerischer ${wd} – ${n} ${n === 1 ? 'Aufgabe' : 'Aufgaben'} heute ☔`, 'Gutes Wetter zum Abhaken ☔'],
+      sunny: (wd, n) => [`Sonniger ${wd} – ${n} ${n === 1 ? 'Aufgabe' : 'Aufgaben'} heute ☀️`, 'Schnell erledigen, dann raus in die Sonne ☀️'],
+      busy: (n) => [`Voller Tag: ${n} Aufgaben – du schaffst das 💪`, `${n} Dinge heute – eins nach dem anderen`],
+      normal: (wd, n) => [`${n} ${n === 1 ? 'Aufgabe' : 'Aufgaben'} für heute – los geht's`, `Heute ${n === 1 ? 'steht eine Sache' : `stehen ${n} Sachen`} an – auf geht's`],
+    },
     wx: {
       rain: 'Regenjacke', umbrella: 'Schirm einpacken', snow: 'Winterstiefel',
       freezing: 'Mütze & Handschuhe', cold: 'warme Jacke', light: 'leichte Jacke',
@@ -55,6 +73,21 @@ const STRINGS = {
     tomorrow: 'Tomorrow', yesterday: 'Yesterday', more: (n) => `+ ${n} more`,
     empty: 'Nothing here', noLists: 'No reminder lists found', untitled: '(untitled)',
     allDay: 'All day',
+    greet: ['Good night', 'Good morning', 'Good afternoon', 'Good evening'],
+    progress: (d, n) => `${d} of ${n} done`,
+    celebrate: { title: 'All done!', lines: ['Time to call it a day', 'Treat yourself', 'Nicely done', 'The rest of the day is yours'] },
+    sub: {
+      birthday: (names) => `It's ${names}'s birthday today 🎂`,
+      allDone: ['All done – great job! 🎉', 'Empty list, clear mind ✨', 'Everything done today 💪'],
+      overdue: (n) => [`${n} overdue ${n === 1 ? 'task' : 'tasks'} – one step at a time`],
+      free: (wd) => [`A free ${wd} – enjoy it 🌿`, 'Nothing urgent today – take a breath ☕'],
+      weekend: (n) => [`Happy weekend! ${n} ${n === 1 ? 'task' : 'tasks'} on the list`, 'Weekend – make it a nice one ☀️'],
+      friday: (n) => [`Friday! ${n} ${n === 1 ? 'task' : 'tasks'} until the weekend 🎈`],
+      rainy: (wd, n) => [`Rainy ${wd} – ${n} ${n === 1 ? 'task' : 'tasks'} today ☔`, 'Good weather for ticking things off ☔'],
+      sunny: (wd, n) => [`Sunny ${wd} – ${n} ${n === 1 ? 'task' : 'tasks'} today ☀️`],
+      busy: (n) => [`Busy day: ${n} tasks – you've got this 💪`],
+      normal: (wd, n) => [`${n} ${n === 1 ? 'task' : 'tasks'} for today – let's go`],
+    },
     wx: {
       rain: 'rain jacket', umbrella: 'bring an umbrella', snow: 'winter boots',
       freezing: 'hat & gloves', cold: 'warm coat', light: 'light jacket',
@@ -388,6 +421,8 @@ function demoReminders() {
 
 // ------------------------------------------------------------- Grouping ----
 
+const GROUP_BY_LIST = () => (process.env.GROUP_BY || 'status').toLowerCase() === 'list';
+
 function byUrgency(a, b) {
   const pa = a.priority || 10, pb = b.priority || 10;
   if (a.due && b.due && +a.due !== +b.due) return a.due - b.due;
@@ -397,7 +432,8 @@ function byUrgency(a, b) {
   return a.title.localeCompare(b.title);
 }
 
-function buildColumns({ lists, todos, events = [], weather = null }) {
+function buildColumns(data) {
+  const { lists, todos, events = [], weather = null } = data;
   const mode = (process.env.GROUP_BY || 'status').toLowerCase();
   if (mode === 'list') {
     const showDone = process.env.SHOW_COMPLETED === '1';
@@ -416,6 +452,7 @@ function buildColumns({ lists, todos, events = [], weather = null }) {
   const startOfDayAfter = new Date(startOfTomorrow);
   startOfDayAfter.setDate(startOfDayAfter.getDate() + 1);
 
+  const day = daySummary(data);
   const open = todos.filter((t) => t.status !== 'COMPLETED');
   const dueToday = (t) => t.due && t.due < startOfTomorrow;
   const dueTomorrow = (t) => t.due && t.due >= startOfTomorrow && t.due < startOfDayAfter;
@@ -426,12 +463,14 @@ function buildColumns({ lists, todos, events = [], weather = null }) {
 
   const middle = [
     // Calendar events first (all-day, then by start time), then reminders.
-    { title: T.today, weather: weather?.[0], items: [...eventsOn(startOfToday, startOfTomorrow), ...open.filter(dueToday).sort(byUrgency)] },
+    // celebrate: everything due today is ticked off (and something was done).
+    { title: T.today, weather: weather?.[0], celebrate: day.open === 0 && day.done > 0, items: [...eventsOn(startOfToday, startOfTomorrow), ...open.filter(dueToday).sort(byUrgency)] },
   ];
   if (process.env.SHOW_COMPLETED !== '0') {
     middle.push({
       title: T.done,
       done: true,
+      progress: day.open + day.done > 0 ? { done: day.done, total: day.open + day.done } : null,
       items: todos
         .filter((t) => t.status === 'COMPLETED' && t.completedAt && t.completedAt >= startOfToday)
         .sort((a, b) => b.completedAt - a.completedAt),
@@ -514,6 +553,69 @@ function formatEventTime(ev) {
   return +ev.end > +ev.start ? `${hm(ev.start)}–${hm(ev.end)}` : hm(ev.start);
 }
 
+// ------------------------------------------------------------------ Mood ----
+
+// Stable per-day choice among variants, so the text doesn't change on every
+// 5-minute refresh but does vary from day to day.
+function pickForToday(variants, salt = 0) {
+  const now = new Date();
+  const seed = now.getFullYear() * 372 + now.getMonth() * 31 + now.getDate() + salt;
+  return variants[seed % variants.length];
+}
+
+// Name from a birthday event title like "🎂 Lena (1990)".
+const birthdayName = (title) => title.replace(/[\p{Extended_Pictographic}️‍]/gu, '').replace(/\(\d{4}\)/, '').trim();
+
+// Facts about today that drive the subtitle, the progress bar and the celebration.
+function daySummary({ todos, events = [], weather = null }) {
+  const now = new Date();
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
+  const startOfTomorrow = new Date(startOfToday);
+  startOfTomorrow.setDate(startOfTomorrow.getDate() + 1);
+  const openToday = todos.filter((t) => t.status !== 'COMPLETED' && t.due && t.due < startOfTomorrow);
+  const doneToday = todos.filter((t) => t.status === 'COMPLETED' && t.completedAt && t.completedAt >= startOfToday);
+  const birthdays = events
+    .filter((e) => e.allDay && e.start < startOfTomorrow && e.end > startOfToday)
+    .filter((e) => /geburtstag|birthday/i.test(e.list) || e.title.startsWith('🎂'))
+    .map((e) => birthdayName(e.title));
+  return {
+    now,
+    open: openToday.length,
+    overdue: openToday.filter((t) => formatDue(t, now)?.overdue).length,
+    done: doneToday.length,
+    birthdays,
+    weather: weather?.[0] ?? null,
+  };
+}
+
+// One friendly line reacting to the day; most relevant situation first.
+function subtitle(s) {
+  const S = T.sub;
+  const wd = s.now.toLocaleDateString(LOCALE, { weekday: 'long' });
+  const day = s.now.getDay(); // 0 = Sunday
+  const w = s.weather;
+  if (s.birthdays.length) return S.birthday(s.birthdays.join(' & '));
+  if (s.open === 0 && s.done > 0) return pickForToday(S.allDone);
+  if (s.overdue > 0) return pickForToday(S.overdue(s.overdue));
+  if (s.open === 0) return pickForToday(S.free(wd));
+  if (day === 0 || day === 6) return pickForToday(S.weekend(s.open));
+  if (day === 5) return pickForToday(S.friday(s.open));
+  if (w && (w.snow > 0 || w.rainChance >= 50 || w.rain >= 1)) return pickForToday(S.rainy(wd, s.open));
+  if (w && w.code <= 1 && w.max >= 18) return pickForToday(S.sunny(wd, s.open));
+  if (s.open >= 5) return pickForToday(S.busy(s.open));
+  return pickForToday(S.normal(wd, s.open));
+}
+
+// Time-of-day greeting for the header, e.g. "Guten Morgen, Daniel".
+function greeting(now) {
+  const h = now.getHours();
+  const [night, morning, day, evening] = T.greet;
+  const text = h >= 5 && h < 11 ? morning : h >= 11 && h < 18 ? day : h >= 18 && h < 22 ? evening : night;
+  const name = process.env.GREETING_NAME?.trim();
+  return name ? `${text}, ${name}` : text;
+}
+
 // Small "repeats" icon (two arrows chasing each other), 13x12px with its top-left at (ox, oy).
 function drawRepeatIcon(ctx, ox, oy, color) {
   const seg = (pts) => {
@@ -532,7 +634,7 @@ function drawRepeatIcon(ctx, ox, oy, color) {
   ctx.restore();
 }
 
-function render(columns, font) {
+function render(columns, font, sub = null) {
   const canvas = createCanvas(WIDTH, HEIGHT);
   const ctx = canvas.getContext('2d');
   const now = new Date();
@@ -553,10 +655,22 @@ function render(columns, font) {
   ctx.fillRect(0, 0, WIDTH, headerH);
   ctx.fillStyle = WHITE;
   ctx.font = `bold 20px ${font}`;
-  drawText(T.header, M, 7);
+  const hello = greeting(now);
+  drawText(hello, M, 7);
+  const helloEnd = M + ctx.measureText(hello).width;
   ctx.font = `15px ${font}`;
   const stamp = now.toLocaleString(LOCALE, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
-  drawText(stamp, WIDTH - M - ctx.measureText(stamp).width, 10);
+  const stampX = WIDTH - M - ctx.measureText(stamp).width;
+  drawText(stamp, stampX, 10);
+
+  // Smart subtitle between greeting and clock, separated by a thin rule.
+  if (sub) {
+    const sx = helloEnd + 22;
+    ctx.fillRect(helloEnd + 10, 9, 1.5, 17);
+    ctx.font = `15px ${font}`;
+    const [line] = wrap(ctx, sub, stampX - 20 - sx, 1);
+    if (line) drawText(line, sx, 10);
+  }
 
   if (!columns.length) {
     ctx.fillStyle = BLACK;
@@ -600,8 +714,11 @@ function render(columns, font) {
   };
 
   // Height a section needs to show all its cards (or the "empty" note).
+  const progressH = 22, celebrateH = 82;
   const neededHeight = (sec) => sectionHead + sectionFoot + weatherHeight(sec)
-    + (sec.items.length ? sec.items.reduce((sum, t) => sum + layoutCard(t).h + cardGap, 0) : 24);
+    + (sec.progress ? progressH : 0)
+    + (sec.items.length ? sec.items.reduce((sum, t) => sum + layoutCard(t).h + cardGap, 0) : sec.celebrate ? 0 : 24)
+    + (sec.celebrate ? celebrateH : 0);
 
   const drawSection = (sec, x, y0, h) => {
     // Frame + title + count badge
@@ -636,6 +753,29 @@ function render(columns, font) {
       const tx = x + 10 + weatherIconSize + 6;
       wx.forEach((ln, i) => drawText(ln, tx, y - 3 + (blockH - textH) / 2 + i * weatherLineH));
       y += weatherHeight(sec);
+    }
+
+    // Progress bar: "3 von 5 erledigt" [██████░░░░]
+    if (sec.progress) {
+      const { done: d, total } = sec.progress;
+      ctx.fillStyle = BLACK;
+      ctx.font = `bold 12px ${font}`;
+      const label = T.progress(d, total);
+      drawText(label, x + 10, y - 3);
+      const bx = x + 10 + ctx.measureText(label).width + 10, bw = x + colW - 10 - bx;
+      if (bw > 20) {
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = BLACK;
+        ctx.beginPath();
+        ctx.roundRect(bx, y - 1, bw, 11, 5.5);
+        ctx.stroke();
+        if (d > 0) {
+          ctx.beginPath();
+          ctx.roundRect(bx, y - 1, Math.max(11, bw * d / total), 11, 5.5);
+          ctx.fill();
+        }
+      }
+      y += progressH;
     }
 
     for (let i = 0; i < sec.items.length; i++) {
@@ -697,7 +837,18 @@ function render(columns, font) {
       y += ch + cardGap;
     }
 
-    if (!sec.items.length) {
+    // Celebration once everything due today is done: big 🎉 and a cheer.
+    if (sec.celebrate && y + celebrateH <= bottom + cardGap) {
+      const cx = x + colW / 2;
+      ctx.fillStyle = BLACK;
+      const center = (str, ty) => drawText(str, cx - ctx.measureText(str).width / 2, ty);
+      ctx.font = `34px ${font}`;
+      center('🎉', y + 2);
+      ctx.font = `bold 16px ${font}`;
+      center(T.celebrate.title, y + 44);
+      ctx.font = `bold 12px ${font}`;
+      center(pickForToday(T.celebrate.lines), y + 64);
+    } else if (!sec.items.length) {
       ctx.fillStyle = BLACK;
       ctx.font = `bold 13px ${font}`;
       drawText(T.empty, cardX + 2, y + 2);
@@ -778,7 +929,7 @@ async function main() {
   const out = outArg || (useWebhook ? null : 'reminders.png');
 
   const data = demo ? demoReminders() : await loadReminders();
-  const canvas = render(buildColumns(data), registerFonts());
+  const canvas = render(buildColumns(data), registerFonts(), GROUP_BY_LIST() ? null : subtitle(daySummary(data)));
   const png = encodeMonoPng(canvas);
 
   if (out) {
