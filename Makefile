@@ -1,35 +1,45 @@
 # Install the reminders board as a system service + 5-minute timer.
 #
-#   make install     set up mise/node/deps, install and start the timer (uses sudo)
+#   make install     set up mise/node/deps, install and start the timer
 #   make uninstall   stop and remove the units
 #   make run         trigger one update now
 #   make status      show timer and last run
 #   make logs        follow the service log
 #
-# Run as the user that owns the project (not with sudo); override if needed:
+# Run it either as the project owner (it calls sudo where needed) or as root,
+# e.g. `sudo make install`. The service always runs as RUN_USER: the invoking
+# user, or SUDO_USER when started via sudo, or root when logged in as root.
+# Override if needed:
 #   make install RUN_USER=daniel MISE=/usr/local/bin/mise
 
 NAME     := webdav-reminders-trmnl
 UNIT_DIR ?= /etc/systemd/system
-RUN_USER ?= $(shell id -un)
 WORKDIR  ?= $(CURDIR)
-MISE     ?= $(shell command -v mise)
 BUILD    := build
+
+ME       := $(shell id -un)
+RUN_USER ?= $(or $(SUDO_USER),$(ME))
+# Privileged commands: plain when already root, via sudo otherwise.
+SUDO     := $(if $(filter 0,$(shell id -u)),,sudo)
+# Per-user setup (mise trust/install, npm ci) must run as RUN_USER so that
+# mise state, the Node install and node_modules end up owned by that user.
+AS_USER  := $(if $(filter $(RUN_USER),$(ME)),,sudo -u $(RUN_USER) -H)
+# sudo resets PATH, so fall back to RUN_USER's login shell to find mise.
+MISE     ?= $(or $(shell command -v mise),$(shell $(AS_USER) sh -lc 'command -v mise' 2>/dev/null))
 
 SERVICE := $(BUILD)/$(NAME).service
 TIMER   := systemd/$(NAME).timer
 
-.PHONY: all setup units install uninstall run status logs clean
+.PHONY: all preflight setup units install uninstall run status logs clean
 
 all: units
 
 setup:
-	@test "$$(id -u)" != 0 || { echo "Run make as the project owner, not with sudo (it calls sudo itself)" >&2; exit 1; }
 	@test -n "$(MISE)" || { echo "mise not found; set MISE=/path/to/mise" >&2; exit 1; }
 	@test -f .envrc || { echo ".envrc missing (CALDAV_URL, CALDAV_USER, CALDAV_PASSWORD, WEBHOOK_URL)" >&2; exit 1; }
-	$(MISE) trust
-	$(MISE) install
-	$(MISE) run install
+	cd $(WORKDIR) && $(AS_USER) $(MISE) trust
+	cd $(WORKDIR) && $(AS_USER) $(MISE) install
+	cd $(WORKDIR) && $(AS_USER) $(MISE) run install
 
 units: $(SERVICE)
 
@@ -40,20 +50,22 @@ $(SERVICE): systemd/$(NAME).service.in Makefile
 	    -e 's|@WORKDIR@|$(WORKDIR)|g' \
 	    -e 's|@MISE@|$(MISE)|g' $< > $@
 
-install: setup units
+preflight:
 	@test ! -e /etc/NIXOS -o "$(UNIT_DIR)" != /etc/systemd/system || { echo "NixOS: /etc/systemd/system is read-only; declare the service in configuration.nix instead" >&2; exit 1; }
-	sudo install -m 644 $(SERVICE) $(TIMER) $(UNIT_DIR)/
-	sudo systemctl daemon-reload
-	sudo systemctl enable --now $(NAME).timer
+
+install: preflight setup units
+	$(SUDO) install -m 644 $(SERVICE) $(TIMER) $(UNIT_DIR)/
+	$(SUDO) systemctl daemon-reload
+	$(SUDO) systemctl enable --now $(NAME).timer
 	@echo "Installed. Next run: $$(systemctl show -P NextElapseUSecRealtime $(NAME).timer)"
 
 uninstall:
-	-sudo systemctl disable --now $(NAME).timer
-	sudo rm -f $(UNIT_DIR)/$(NAME).service $(UNIT_DIR)/$(NAME).timer
-	sudo systemctl daemon-reload
+	-$(SUDO) systemctl disable --now $(NAME).timer
+	$(SUDO) rm -f $(UNIT_DIR)/$(NAME).service $(UNIT_DIR)/$(NAME).timer
+	$(SUDO) systemctl daemon-reload
 
 run:
-	sudo systemctl start $(NAME).service
+	$(SUDO) systemctl start $(NAME).service
 
 status:
 	systemctl list-timers $(NAME).timer
