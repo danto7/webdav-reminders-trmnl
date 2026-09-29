@@ -4,6 +4,9 @@ node = "24"
 [env]
 # Load CALDAV_* / WEBHOOK_URL / LOCALE from .envrc, so `mise exec` (and the
 # systemd service, which runs through it) sees the same config as your shell.
+# .envrc is sourced by bash, which escapes non-ASCII characters ("ö" -> "\303\266")
+# when no UTF-8 locale is set, e.g. under systemd. Force one before sourcing.
+LANG = "C.UTF-8"
 _.source = ".envrc"
 
 [tasks.install]
