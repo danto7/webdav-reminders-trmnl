@@ -1,0 +1,16 @@
+# Renders the reminders board and POSTs it to WEBHOOK_URL.
+# Runs through mise as @USER@, so Node comes from mise.toml and the config from .envrc.
+#
+# Template: `make install` fills in the @...@ placeholders and installs this as
+# a system service together with webdav-reminders-trmnl.timer.
+
+[Unit]
+Description=Render reminders kanban board and push it to TRMNL
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@WORKDIR@
+ExecStart=@MISE@ exec -- node render.js

@@ -1,0 +1,15 @@
+[tools]
+node = "24"
+
+[env]
+# Load CALDAV_* / WEBHOOK_URL / LOCALE from .envrc, so `mise exec` (and the
+# systemd service, which runs through it) sees the same config as your shell.
+_.source = ".envrc"
+
+[tasks.install]
+description = "Install npm dependencies"
+run = "npm ci"
+
+[tasks.render]
+description = "Render the board and POST it to WEBHOOK_URL"
+run = "node render.js"
