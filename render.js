@@ -88,6 +88,11 @@ const STRINGS = {
       rain: 'Regenjacke', umbrella: 'Schirm einpacken', snow: 'Winterstiefel',
       freezing: 'Mütze & Handschuhe', cold: 'warme Jacke', light: 'leichte Jacke',
       hot: 'luftig anziehen', sun: 'Sonnencreme', wind: 'windfeste Jacke',
+      layers: 'Zwiebellook', sweater: 'Pullover', tshirt: 'T-Shirt-Wetter',
+      cond: {
+        clear: 'Sonnig', partly: 'Heiter', cloudy: 'Bewölkt', fog: 'Nebel', drizzle: 'Nieselregen',
+        rain: 'Regen', showers: 'Schauer', snow: 'Schnee', storm: 'Gewitter',
+      },
     },
   },
   en: {
@@ -129,6 +134,11 @@ const STRINGS = {
       rain: 'rain jacket', umbrella: 'bring an umbrella', snow: 'winter boots',
       freezing: 'hat & gloves', cold: 'warm coat', light: 'light jacket',
       hot: 'dress light', sun: 'sunscreen', wind: 'windproof jacket',
+      layers: 'dress in layers', sweater: 'sweater', tshirt: 'T-shirt weather',
+      cond: {
+        clear: 'Sunny', partly: 'Mostly sunny', cloudy: 'Cloudy', fog: 'Fog', drizzle: 'Drizzle',
+        rain: 'Rain', showers: 'Showers', snow: 'Snow', storm: 'Thunderstorms',
+      },
     },
   },
 };
@@ -437,18 +447,37 @@ function weatherAdvice(w) {
   if (w.snow > 0) advice.push(T.wx.snow);
   else if (w.rainChance >= 50 || w.rain >= 1) advice.push(T.wx.rain);
   else if (w.rainChance >= 30) advice.push(T.wx.umbrella);
+  // Exactly one clothing tip for every temperature range.
   if (w.feelsMin < 3) advice.push(T.wx.freezing);
+  else if (w.feelsMin < 10 && w.feelsMax >= 22) advice.push(T.wx.layers); // cold morning, warm afternoon
   else if (w.feelsMin < 10) advice.push(T.wx.cold);
   else if (w.feelsMax < 17) advice.push(T.wx.light);
-  if (w.feelsMax >= 26) advice.push(T.wx.hot);
+  else if (w.feelsMax < 23) advice.push(T.wx.sweater);
+  else if (w.feelsMax < 26) advice.push(T.wx.tshirt);
+  else advice.push(T.wx.hot);
   if (w.uv >= 6) advice.push(T.wx.sun);
   if (w.gusts >= 50) advice.push(T.wx.wind);
   return advice;
 }
 
-// "9–14° · 80 % · Regenjacke, warme Jacke" (the icon is drawn separately)
+// WMO weather code -> short localized description.
+function weatherCondition(code) {
+  const C = T.wx.cond;
+  if (code === 0) return C.clear;
+  if (code <= 2) return C.partly;
+  if (code === 3) return C.cloudy;
+  if (code === 45 || code === 48) return C.fog;
+  if (code >= 51 && code <= 57) return C.drizzle;
+  if (code >= 61 && code <= 67) return C.rain;
+  if (code >= 80 && code <= 82) return C.showers;
+  if ((code >= 71 && code <= 77) || code === 85 || code === 86) return C.snow;
+  if (code >= 95) return C.storm;
+  return '';
+}
+
+// "Regen · 9°–14° · 80 % · Regenjacke, warme Jacke" (the icon is drawn separately)
 function formatWeather(w) {
-  const parts = [`${Math.round(w.min)}–${Math.round(w.max)}°`];
+  const parts = [weatherCondition(w.code), `${Math.round(w.min)}°–${Math.round(w.max)}°`].filter(Boolean);
   if (w.rainChance >= 30) parts.push(`${w.rainChance} %`);
   const advice = weatherAdvice(w);
   if (advice.length) parts.push(advice.join(', '));
