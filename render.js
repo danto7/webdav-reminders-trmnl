@@ -9,7 +9,8 @@
 //   GROUP_BY         "status" (default: To Do / Today / Done columns) or "list"
 //                    (one column per reminder list)
 //   SHOW_COMPLETED   status mode: "0" hides the Done (completed today) column; list mode: "1" includes completed
-//   FONT_PATH        TTF/OTF to use (default: first DejaVu/Liberation font found)
+//   FONT_PATH        TTF/OTF to use instead of the bundled fonts/DejaVuSans.ttf
+//   FONT_BOLD_PATH   bold variant (default: bundled DejaVuSans-Bold.ttf, or FONT_PATH if set)
 //   LOCALE           BCP 47 locale for dates/times and labels, e.g. de-DE, en-GB (default: de-DE;
 //                    labels exist for de and en, other languages fall back to en)
 //   WEBHOOK_URL      if set, POST the rendered PNG to this URL (raw body, image/png)
@@ -22,8 +23,9 @@
 import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
 import { XMLParser } from 'fast-xml-parser';
 import ICAL from 'ical.js';
-import { writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { crc32, deflateSync } from 'node:zlib';
 
 const WIDTH = 800;
@@ -217,30 +219,16 @@ function buildColumns({ lists, todos }) {
 
 // ------------------------------------------------------------ Rendering ----
 
-function findFont() {
-  if (process.env.FONT_PATH) return process.env.FONT_PATH;
-  const dirs = ['/run/current-system/sw/share/X11/fonts', '/usr/share/fonts', '/usr/local/share/fonts', `${process.env.HOME}/.local/share/fonts`, '/System/Library/Fonts', '/Library/Fonts'];
-  const wanted = [/^DejaVuSans\.ttf$/, /^LiberationSans-Regular\.ttf$/, /^Arial\.ttf$/i, /^Helvetica\.ttc$/i];
-  const walk = (dir, depth = 0) => {
-    if (depth > 4 || !existsSync(dir)) return [];
-    try {
-      return readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(join(dir, e.name), depth + 1) : [join(dir, e.name)]));
-    } catch { return []; }
-  };
-  const files = dirs.flatMap((d) => walk(d));
-  for (const re of wanted) {
-    const hit = files.find((f) => re.test(f.split('/').pop()));
-    if (hit) return hit;
-  }
-  return null;
-}
+// Fonts ship with the script (fonts/), so rendering never depends on what the
+// host has installed. Without a usable font, canvas silently draws no text.
+const FONT_DIR = fileURLToPath(new URL('./fonts/', import.meta.url));
 
 function registerFonts() {
-  const regular = findFont();
-  if (!regular) return 'sans-serif';
-  GlobalFonts.registerFromPath(regular, 'Board');
-  const bold = regular.replace(/(\.ttf|\.otf|\.ttc)$/i, '-Bold$1').replace('-Regular-Bold', '-Bold');
-  if (existsSync(bold)) GlobalFonts.registerFromPath(bold, 'Board');
+  const regular = process.env.FONT_PATH || join(FONT_DIR, 'DejaVuSans.ttf');
+  const bold = process.env.FONT_BOLD_PATH || (process.env.FONT_PATH ? regular : join(FONT_DIR, 'DejaVuSans-Bold.ttf'));
+  for (const path of new Set([regular, bold])) {
+    if (!GlobalFonts.registerFromPath(path, 'Board')) throw new Error(`Could not load font ${path}`);
+  }
   return 'Board';
 }
 
