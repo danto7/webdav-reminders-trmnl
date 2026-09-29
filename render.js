@@ -6,7 +6,7 @@
 //   CALDAV_URL       calendar-home or single-calendar collection URL (required)
 //   CALDAV_USER      username
 //   CALDAV_PASSWORD  password / app password
-//   GROUP_BY         "status" (default: To Do / Today / Done columns) or "list"
+//   GROUP_BY         "status" (default: To Do | Today over Done | Tomorrow) or "list"
 //                    (one column per reminder list)
 //   SHOW_COMPLETED   status mode: "0" hides the Done (completed today) column; list mode: "1" includes completed
 //   FONT_PATH        TTF/OTF to use instead of the bundled fonts/DejaVuSans.ttf
@@ -14,8 +14,10 @@
 //   FONT_EMOJI_PATH  emoji fallback font (default: bundled monochrome fonts/NotoEmoji.ttf)
 //   LOCALE           BCP 47 locale for dates/times and labels, e.g. de-DE, en-GB (default: de-DE;
 //                    labels exist for de and en, other languages fall back to en)
-//   SHOW_EVENTS      "0" disables today's calendar events in the Today column (default: shown)
+//   SHOW_EVENTS      "0" disables calendar events in the Today/Tomorrow columns (default: shown)
 //   EVENT_CALENDARS  comma-separated calendar names to take events from (default: all)
+//   WEATHER_LOCATION place name for the weather line in Heute/Morgen, e.g. "Hamburg"
+//   WEATHER_LAT/LON  coordinates instead of WEATHER_LOCATION (no weather if neither is set)
 //   WEBHOOK_URL      if set, POST the rendered PNG to this URL (raw body, image/png)
 //
 // Usage: node render.js               (POST to WEBHOOK_URL if set, else write reminders.png)
@@ -42,12 +44,22 @@ const STRINGS = {
     tomorrow: 'Morgen', yesterday: 'Gestern', more: (n) => `+ ${n} weitere`,
     empty: 'Nichts zu tun', noLists: 'Keine Erinnerungslisten gefunden', untitled: '(ohne Titel)',
     allDay: 'Ganztägig',
+    wx: {
+      rain: 'Regenjacke', umbrella: 'Schirm einpacken', snow: 'Winterstiefel',
+      freezing: 'Mütze & Handschuhe', cold: 'warme Jacke', light: 'leichte Jacke',
+      hot: 'luftig anziehen', sun: 'Sonnencreme', wind: 'windfeste Jacke',
+    },
   },
   en: {
     header: 'Reminders', todo: 'To Do', today: 'Today', done: 'Done',
     tomorrow: 'Tomorrow', yesterday: 'Yesterday', more: (n) => `+ ${n} more`,
     empty: 'Nothing here', noLists: 'No reminder lists found', untitled: '(untitled)',
     allDay: 'All day',
+    wx: {
+      rain: 'rain jacket', umbrella: 'bring an umbrella', snow: 'winter boots',
+      freezing: 'hat & gloves', cold: 'warm coat', light: 'light jacket',
+      hot: 'dress light', sun: 'sunscreen', wind: 'windproof jacket',
+    },
   },
 };
 const T = STRINGS[LOCALE.split(/[-_]/)[0].toLowerCase()] ?? STRINGS.en;
@@ -217,12 +229,13 @@ async function fetchEvents(cal, start, end) {
   return events;
 }
 
-async function loadTodaysEvents() {
+// Events of today and tomorrow (the Heute and Morgen columns).
+async function loadUpcomingEvents() {
   if (process.env.SHOW_EVENTS === '0') return [];
   const start = new Date();
   start.setHours(0, 0, 0, 0);
   const end = new Date(start);
-  end.setDate(end.getDate() + 1);
+  end.setDate(end.getDate() + 2);
   try {
     const cals = await discoverEventCalendars(await discoverCalendarHome(process.env.CALDAV_URL));
     const results = await Promise.all(
@@ -237,6 +250,88 @@ async function loadTodaysEvents() {
     console.error(`Could not load calendar events: ${err.message}`);
     return [];
   }
+}
+
+// --------------------------------------------------------------- Weather ----
+
+// Daily forecast for today and tomorrow from Open-Meteo (free, no API key).
+// Location: WEATHER_LAT + WEATHER_LON, or WEATHER_LOCATION (a place name that
+// is geocoded). Without either, the board shows no weather.
+async function loadWeather() {
+  let lat = process.env.WEATHER_LAT, lon = process.env.WEATHER_LON;
+  const place = process.env.WEATHER_LOCATION;
+  if (!(lat && lon) && !place) return null;
+  try {
+    if (!(lat && lon)) {
+      const url = `https://geocoding-api.open-meteo.com/v1/search?count=1&name=${encodeURIComponent(place)}`;
+      const hit = (await (await fetch(url)).json()).results?.[0];
+      if (!hit) throw new Error(`location "${place}" not found`);
+      ({ latitude: lat, longitude: lon } = hit);
+    }
+    const daily = [
+      'weather_code', 'temperature_2m_max', 'temperature_2m_min', 'apparent_temperature_max',
+      'apparent_temperature_min', 'precipitation_sum', 'precipitation_probability_max',
+      'snowfall_sum', 'wind_gusts_10m_max', 'uv_index_max',
+    ];
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
+      + `&daily=${daily.join(',')}&timezone=auto&forecast_days=2`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`forecast -> ${res.status} ${res.statusText}`);
+    const d = (await res.json()).daily;
+    return [0, 1].map((i) => ({
+      code: d.weather_code[i],
+      min: d.temperature_2m_min[i],
+      max: d.temperature_2m_max[i],
+      feelsMin: d.apparent_temperature_min[i],
+      feelsMax: d.apparent_temperature_max[i],
+      rain: d.precipitation_sum[i],
+      rainChance: d.precipitation_probability_max[i],
+      snow: d.snowfall_sum[i],
+      gusts: d.wind_gusts_10m_max[i],
+      uv: d.uv_index_max[i],
+    }));
+  } catch (err) {
+    // Weather is an extra; never let it break the board.
+    console.error(`Could not load weather: ${err.message}`);
+    return null;
+  }
+}
+
+// WMO weather code -> emoji (drawn in black and white by the Noto Emoji font).
+function weatherIcon(code) {
+  if (code === 0) return '☀️';
+  if (code <= 2) return '🌤️';
+  if (code === 3) return '☁️';
+  if (code === 45 || code === 48) return '🌫️';
+  if (code >= 51 && code <= 57) return '🌦️';
+  if ((code >= 61 && code <= 67) || (code >= 80 && code <= 82)) return '🌧️';
+  if ((code >= 71 && code <= 77) || code === 85 || code === 86) return '🌨️';
+  if (code >= 95) return '⛈️';
+  return '🌡️';
+}
+
+// What to wear / bring, based on how the day will feel.
+function weatherAdvice(w) {
+  const advice = [];
+  if (w.snow > 0) advice.push(T.wx.snow);
+  else if (w.rainChance >= 50 || w.rain >= 1) advice.push(T.wx.rain);
+  else if (w.rainChance >= 30) advice.push(T.wx.umbrella);
+  if (w.feelsMin < 3) advice.push(T.wx.freezing);
+  else if (w.feelsMin < 10) advice.push(T.wx.cold);
+  else if (w.feelsMax < 17) advice.push(T.wx.light);
+  if (w.feelsMax >= 26) advice.push(T.wx.hot);
+  if (w.uv >= 6) advice.push(T.wx.sun);
+  if (w.gusts >= 50) advice.push(T.wx.wind);
+  return advice;
+}
+
+// "9–14° · 80 % · Regenjacke, warme Jacke" (the icon is drawn separately)
+function formatWeather(w) {
+  const parts = [`${Math.round(w.min)}–${Math.round(w.max)}°`];
+  if (w.rainChance >= 30) parts.push(`${w.rainChance} %`);
+  const advice = weatherAdvice(w);
+  if (advice.length) parts.push(advice.join(', '));
+  return parts.join(' · ');
 }
 
 async function discoverOrFallback() {
@@ -257,8 +352,8 @@ async function dumpReminders() {
 
 async function loadReminders() {
   const lists = await discoverOrFallback();
-  const [all, events] = await Promise.all([Promise.all(lists.map(fetchTodos)), loadTodaysEvents()]);
-  return { lists: lists.map((l) => l.name), todos: all.flat(), events };
+  const [all, events, weather] = await Promise.all([Promise.all(lists.map(fetchTodos)), loadUpcomingEvents(), loadWeather()]);
+  return { lists: lists.map((l) => l.name), todos: all.flat(), events, weather };
 }
 
 function demoReminders() {
@@ -281,9 +376,14 @@ function demoReminders() {
   const events = [
     e('Tag der Deutschen Einheit', 'Feiertage', d(0, 0), d(1, 0), { allDay: true }),
     e('Team-Standup', 'Persönlich', d(0, 9), d(0, 10), { recurring: true }),
+    e('Kontrolltermin Zahnarzt', 'Persönlich', d(1, 10), d(1, 11)),
     e('🎂 Lena (1990)', 'Geburtstage', d(0, 0), d(1, 0), { allDay: true, recurring: true }),
   ];
-  return { lists: ['Zuhause', 'Besorgungen', 'Arbeit'], todos, events };
+  const weather = [
+    { code: 61, min: 8, max: 13, feelsMin: 5, feelsMax: 11, rain: 6, rainChance: 85, snow: 0, gusts: 45, uv: 1 },
+    { code: 1, min: 12, max: 25, feelsMin: 11, feelsMax: 26, rain: 0, rainChance: 10, snow: 0, gusts: 20, uv: 6 },
+  ];
+  return { lists: ['Zuhause', 'Besorgungen', 'Arbeit'], todos, events, weather };
 }
 
 // ------------------------------------------------------------- Grouping ----
@@ -297,36 +397,39 @@ function byUrgency(a, b) {
   return a.title.localeCompare(b.title);
 }
 
-function buildColumns({ lists, todos, events = [] }) {
+function buildColumns({ lists, todos, events = [], weather = null }) {
   const mode = (process.env.GROUP_BY || 'status').toLowerCase();
   if (mode === 'list') {
     const showDone = process.env.SHOW_COMPLETED === '1';
-    return lists.map((name) => ({
+    return lists.map((name) => [{
       title: name,
       items: todos.filter((t) => t.list === name && (showDone || t.status !== 'COMPLETED')).sort(byUrgency),
-    }));
+    }]);
   }
-  // Status board: To Do = later / undated, Today = due today or overdue, Done = completed today.
-  const endOfToday = new Date();
-  endOfToday.setHours(23, 59, 59, 999);
-  const startOfToday = new Date(endOfToday);
+  // Status board, three columns:
+  //   Zu erledigen: later / undated | Heute (due today or overdue) over Erledigt
+  //   (completed today) | Morgen (due tomorrow). Each column is a stack of sections.
+  const startOfToday = new Date();
   startOfToday.setHours(0, 0, 0, 0);
+  const startOfTomorrow = new Date(startOfToday);
+  startOfTomorrow.setDate(startOfTomorrow.getDate() + 1);
+  const startOfDayAfter = new Date(startOfTomorrow);
+  startOfDayAfter.setDate(startOfDayAfter.getDate() + 1);
+
   const open = todos.filter((t) => t.status !== 'COMPLETED');
-  const dueToday = (t) => t.due && t.due <= endOfToday;
-  const cols = [
-    // Undated reminders first, then by due date.
-    { title: T.todo, items: open.filter((t) => !dueToday(t)).sort((a, b) => !!a.due - !!b.due || byUrgency(a, b)) },
-    {
-      title: T.today,
-      // Today's calendar events (all-day first, then by start time), then reminders.
-      items: [
-        ...[...events].sort((a, b) => b.allDay - a.allDay || a.start - b.start || a.title.localeCompare(b.title)),
-        ...open.filter(dueToday).sort(byUrgency),
-      ],
-    },
+  const dueToday = (t) => t.due && t.due < startOfTomorrow;
+  const dueTomorrow = (t) => t.due && t.due >= startOfTomorrow && t.due < startOfDayAfter;
+  // Timed events overlapping the day; zero-length events count on the day they start.
+  const eventsOn = (from, to) => events
+    .filter((e) => e.start < to && (e.end > from || (+e.end === +e.start && e.start >= from)))
+    .sort((a, b) => b.allDay - a.allDay || a.start - b.start || a.title.localeCompare(b.title));
+
+  const middle = [
+    // Calendar events first (all-day, then by start time), then reminders.
+    { title: T.today, weather: weather?.[0], items: [...eventsOn(startOfToday, startOfTomorrow), ...open.filter(dueToday).sort(byUrgency)] },
   ];
   if (process.env.SHOW_COMPLETED !== '0') {
-    cols.push({
+    middle.push({
       title: T.done,
       done: true,
       items: todos
@@ -334,6 +437,12 @@ function buildColumns({ lists, todos, events = [] }) {
         .sort((a, b) => b.completedAt - a.completedAt),
     });
   }
+  const cols = [
+    // Undated reminders first, then by due date.
+    [{ title: T.todo, items: open.filter((t) => !dueToday(t) && !dueTomorrow(t)).sort((a, b) => !!a.due - !!b.due || byUrgency(a, b)) }],
+    middle,
+    [{ title: T.tomorrow, weather: weather?.[1], items: [...eventsOn(startOfTomorrow, startOfDayAfter), ...open.filter(dueTomorrow).sort(byUrgency)] }],
+  ];
   return cols;
 }
 
@@ -461,47 +570,80 @@ function render(columns, font) {
   const colW = Math.floor((WIDTH - 2 * M - gap * (columns.length - 1)) / columns.length);
   const colH = HEIGHT - top - M;
 
-  columns.forEach((col, ci) => {
-    const x = M + ci * (colW + gap);
-    const done = col.done;
+  // Card geometry
+  const pad = 7, lineH = 17, cardGap = 6, sectionHead = 42, sectionFoot = 8, moreH = 20;
+  const cardW = colW - 16;
 
-    // Column frame + title
+  // Text layout and height of one card.
+  const layoutCard = (t) => {
+    const isEvent = t.kind === 'event';
+    ctx.font = `15px ${font}`;
+    const lines = wrap(ctx, t.title, cardW - 2 * pad - (t.priority && t.priority <= 4 ? 12 : 0) - (isEvent ? 4 : 0), 3);
+    const due = isEvent ? null : formatDue(t, now);
+    const when = isEvent ? formatEventTime(t) : due?.label;
+    const meta = [when, process.env.GROUP_BY === 'list' ? null : t.list].filter(Boolean);
+    const hasMeta = meta.length > 0 || t.recurring;
+    return { t, isEvent, lines, due, meta, hasMeta, h: pad * 2 + lines.length * lineH + (hasMeta ? 16 : 0) };
+  };
+
+  // Weather under a section title: a large icon, with the forecast text
+  // wrapped to at most two lines beside it.
+  const weatherLineH = 15, weatherIconSize = 22;
+  const weatherLines = (sec) => {
+    if (!sec.weather) return [];
+    ctx.font = `bold 12px ${font}`;
+    return wrap(ctx, formatWeather(sec.weather), colW - 20 - weatherIconSize - 6, 2);
+  };
+  const weatherHeight = (sec) => {
+    const n = weatherLines(sec).length;
+    return n ? Math.max(weatherIconSize, n * weatherLineH) + 6 : 0;
+  };
+
+  // Height a section needs to show all its cards (or the "empty" note).
+  const neededHeight = (sec) => sectionHead + sectionFoot + weatherHeight(sec)
+    + (sec.items.length ? sec.items.reduce((sum, t) => sum + layoutCard(t).h + cardGap, 0) : 24);
+
+  const drawSection = (sec, x, y0, h) => {
+    // Frame + title + count badge
     ctx.strokeStyle = BLACK;
     ctx.lineWidth = 2;
-    ctx.strokeRect(x + 1, top + 1, colW - 2, colH - 2);
+    ctx.strokeRect(x + 1, y0 + 1, colW - 2, h - 2);
     ctx.fillStyle = BLACK;
     ctx.font = `bold 16px ${font}`;
-    drawText(col.title, x + 8, top + 8);
-    const count = String(col.items.length);
+    drawText(sec.title, x + 8, y0 + 8);
+    const count = String(sec.items.length);
     ctx.font = `bold 13px ${font}`;
     const cw = Math.max(22, ctx.measureText(count).width + 12);
     ctx.beginPath();
-    ctx.roundRect(x + colW - cw - 8, top + 7, cw, 20, 10);
+    ctx.roundRect(x + colW - cw - 8, y0 + 7, cw, 20, 10);
     ctx.fill();
     ctx.fillStyle = WHITE;
-    drawText(count, x + colW - 8 - cw / 2 - ctx.measureText(count).width / 2, top + 10);
+    drawText(count, x + colW - 8 - cw / 2 - ctx.measureText(count).width / 2, y0 + 10);
     ctx.fillStyle = BLACK;
-    ctx.fillRect(x + 6, top + 32, colW - 12, 2);
+    ctx.fillRect(x + 6, y0 + 32, colW - 12, 2);
 
-    // Cards
-    const cardX = x + 8, cardW = colW - 16, pad = 7, lineH = 17;
-    const bottom = top + colH - 8;
-    let y = top + 42;
-    const moreH = 20;
+    const cardX = x + 8;
+    const bottom = y0 + h - sectionFoot;
+    let y = y0 + sectionHead;
 
-    for (let i = 0; i < col.items.length; i++) {
-      const t = col.items[i];
-      const remaining = col.items.length - i;
-      const isEvent = t.kind === 'event';
-      ctx.font = `15px ${font}`;
-      const lines = wrap(ctx, t.title, cardW - 2 * pad - (t.priority && t.priority <= 4 ? 12 : 0) - (isEvent ? 4 : 0), 3);
-      const due = isEvent ? null : formatDue(t, now);
-      const when = isEvent ? formatEventTime(t) : due?.label;
-      const meta = [when, process.env.GROUP_BY === 'list' ? null : t.list].filter(Boolean);
-      const hasMeta = meta.length > 0 || t.recurring;
-      const h = pad * 2 + lines.length * lineH + (hasMeta ? 16 : 0);
+    const wx = weatherLines(sec);
+    if (wx.length) {
+      const textH = wx.length * weatherLineH;
+      const blockH = Math.max(weatherIconSize, textH);
+      ctx.font = `${weatherIconSize}px ${font}`;
+      drawText(weatherIcon(sec.weather.code), x + 9, y - 4 + (blockH - weatherIconSize) / 2);
+      ctx.font = `bold 12px ${font}`;
+      const tx = x + 10 + weatherIconSize + 6;
+      wx.forEach((ln, i) => drawText(ln, tx, y - 3 + (blockH - textH) / 2 + i * weatherLineH));
+      y += weatherHeight(sec);
+    }
+
+    for (let i = 0; i < sec.items.length; i++) {
+      const { t, isEvent, lines, due, meta, hasMeta, h: ch } = layoutCard(sec.items[i]);
+      const remaining = sec.items.length - i;
       const limit = remaining > 1 ? bottom - moreH : bottom;
-      if (y + h > limit) {
+      if (y + ch > limit) {
+        ctx.fillStyle = BLACK;
         ctx.font = `bold 13px ${font}`;
         drawText(T.more(remaining), cardX + 2, y + 2);
         break;
@@ -510,7 +652,7 @@ function render(columns, font) {
       // Card frame: overdue cards are inverted to stand out.
       const inverted = due?.overdue;
       ctx.beginPath();
-      ctx.roundRect(cardX, y, cardW, h, 5);
+      ctx.roundRect(cardX, y, cardW, ch, 5);
       if (inverted) { ctx.fillStyle = BLACK; ctx.fill(); }
       else { ctx.lineWidth = 1.5; ctx.strokeStyle = BLACK; ctx.stroke(); }
       const fg = inverted ? WHITE : BLACK;
@@ -520,7 +662,7 @@ function render(columns, font) {
       let tx = cardX + pad;
       if (isEvent) {
         ctx.beginPath();
-        ctx.roundRect(cardX, y, 6, h, [5, 0, 0, 5]);
+        ctx.roundRect(cardX, y, 6, ch, [5, 0, 0, 5]);
         ctx.fill();
         tx += 4;
       }
@@ -536,7 +678,7 @@ function render(columns, font) {
       lines.forEach((ln, li) => {
         const ly = y + pad + li * lineH;
         drawText(ln, tx, ly);
-        if (done) {
+        if (sec.done) {
           const w = ctx.measureText(ln).width;
           ctx.fillRect(tx, ly + 8, w, 1.5);
         }
@@ -552,13 +694,36 @@ function render(columns, font) {
         ctx.font = `bold 12px ${font}`;
         drawText(meta.join(' · '), mx, my);
       }
-      y += h + 6;
+      y += ch + cardGap;
     }
 
-    if (!col.items.length) {
+    if (!sec.items.length) {
+      ctx.fillStyle = BLACK;
       ctx.font = `bold 13px ${font}`;
       drawText(T.empty, cardX + 2, y + 2);
     }
+  };
+
+  columns.forEach((stack, ci) => {
+    const x = M + ci * (colW + gap);
+    // Lower sections (e.g. Erledigt) take what they need, capped at 40% of the
+    // column unless the first section has room to spare; the first gets the rest.
+    const avail = colH - gap * (stack.length - 1);
+    const heights = stack.map(() => 0);
+    let used = 0;
+    for (let i = stack.length - 1; i > 0; i--) {
+      const spare = avail - used - neededHeight(stack[0]);
+      const cap = Math.max(avail * 0.4, spare);
+      heights[i] = Math.round(Math.max(sectionHead + sectionFoot + 24, Math.min(neededHeight(stack[i]), cap)));
+      used += heights[i];
+    }
+    heights[0] = avail - used;
+
+    let y = top;
+    stack.forEach((sec, si) => {
+      drawSection(sec, x, y, heights[si]);
+      y += heights[si] + gap;
+    });
   });
 
   return canvas;
@@ -618,7 +783,7 @@ async function main() {
 
   if (out) {
     writeFileSync(out, png);
-    console.log(`Wrote ${out} (${WIDTH}x${HEIGHT}, ${data.todos.length} reminders, ${data.events?.length ?? 0} events today)`);
+    console.log(`Wrote ${out} (${WIDTH}x${HEIGHT}, ${data.todos.length} reminders, ${data.events?.length ?? 0} events today/tomorrow)`);
   }
   if (useWebhook) await postWebhook(webhook, png);
 }
