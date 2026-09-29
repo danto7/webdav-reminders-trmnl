@@ -4,6 +4,10 @@
 //
 // Config via environment:
 //   CALDAV_URL       calendar-home or single-calendar collection URL (required)
+//                    Required: CALDAV_URL, CALDAV_USER, CALDAV_PASSWORD, GREETING_NAME, a weather
+//                    location, and WEBHOOK_URL unless an output file is given.
+//                    If a setting is missing or invalid, or anything else fails (server,
+//                    weather, calendars), an error image is delivered instead of the board.
 //   CALDAV_USER      username
 //   CALDAV_PASSWORD  password / app password
 //   GROUP_BY         "status" (default: To Do | Today over Done | Tomorrow) or "list"
@@ -15,13 +19,16 @@
 //   LOCALE           BCP 47 locale for dates/times and labels, e.g. de-DE, en-GB (default: de-DE;
 //                    labels exist for de and en, other languages fall back to en)
 //   SHOW_EVENTS      "0" disables calendar events in the Today/Tomorrow columns (default: shown)
-//   EVENT_CALENDARS  comma-separated calendar names to take events from (default: all)
-//   GREETING_NAME    name for the header greeting, e.g. "Daniel" -> "Guten Morgen, Daniel"
-//   WEATHER_LOCATION place name for the weather line in Heute/Morgen, e.g. "Hamburg"
-//   WEATHER_LAT/LON  coordinates instead of WEATHER_LOCATION (no weather if neither is set)
-//   WEBHOOK_URL      if set, POST the rendered PNG to this URL (raw body, image/png)
+//   EVENT_CALENDARS  comma-separated calendar names to take events from (default: all;
+//                    unknown names are reported as an error)
+//   GREETING_NAME    name for the header greeting, e.g. "Daniel" -> "Guten Morgen, Daniel" (required)
+//   WEATHER_LOCATION place name for the weather line in Heute/Morgen, e.g. "Hamburg" (required)
+//   WEATHER_LAT/LON  coordinates instead of WEATHER_LOCATION
+//   WEBHOOK_URL      POST the rendered PNG to this URL (raw body, image/png); required
+//                    unless an output file is given on the command line
 //
-// Usage: node render.js               (POST to WEBHOOK_URL if set, else write reminders.png)
+// Usage: node render.js               (POST to WEBHOOK_URL; if it is missing, the error image
+//                                      is written to reminders.png)
 //        node render.js output.png    (write output.png only; never triggers the webhook)
 //        node render.js --demo out.png            (render sample data, no network)
 //        node render.js --dump        (print raw iCalendar data of all reminders; no image)
@@ -43,6 +50,21 @@ const STRINGS = {
   de: {
     header: 'Erinnerungen', todo: 'Zu erledigen', today: 'Heute', done: 'Erledigt',
     tomorrow: 'Morgen', yesterday: 'Gestern', more: (n) => `+ ${n} weitere`,
+    error: {
+      header: 'Board konnte nicht erstellt werden', title: 'Fehler', configTitle: 'Einstellungen prüfen',
+      configIntro: 'Diese Umgebungsvariablen fehlen oder sind ungültig:',
+      weather: 'Wetterdienst nicht erreichbar', calendar: (name) => `Kalender "${name}" nicht lesbar`,
+      reasons: {
+        notSet: 'nicht gesetzt', webhookNotSet: 'nicht gesetzt (oder Bilddatei angeben: node render.js board.png)',
+        weatherNotSet: 'nicht gesetzt (alternativ WEATHER_LAT und WEATHER_LON)',
+        url: 'keine gültige http(s)-URL', locale: 'kein gültiges Sprachkürzel (z. B. de-DE)',
+        oneOf: (a) => `muss ${a.map((v) => `"${v}"`).join(' oder ')} sein`,
+        pair: 'fehlt (WEATHER_LAT und WEATHER_LON nur zusammen)', range: (m) => `muss eine Zahl zwischen -${m} und ${m} sein`,
+        place: (p) => `Ort "${p}" nicht gefunden`,
+        calendars: (u, all) => `nicht gefunden: ${u.join(', ')} (vorhanden: ${all.join(', ')})`,
+      },
+      hint: 'Konfiguration prüfen (z. B. .envrc). Beim nächsten Durchlauf wird es automatisch erneut versucht.',
+    },
     empty: 'Nichts zu tun', noLists: 'Keine Erinnerungslisten gefunden', untitled: '(ohne Titel)',
     allDay: 'Ganztägig',
     greet: ['Gute Nacht', 'Guten Morgen', 'Guten Tag', 'Guten Abend'],
@@ -71,6 +93,21 @@ const STRINGS = {
   en: {
     header: 'Reminders', todo: 'To Do', today: 'Today', done: 'Done',
     tomorrow: 'Tomorrow', yesterday: 'Yesterday', more: (n) => `+ ${n} more`,
+    error: {
+      header: 'Could not build the board', title: 'Error', configTitle: 'Check your settings',
+      configIntro: 'These environment variables are missing or invalid:',
+      weather: 'Weather service unavailable', calendar: (name) => `Calendar "${name}" could not be read`,
+      reasons: {
+        notSet: 'not set', webhookNotSet: 'not set (or pass an image file: node render.js board.png)',
+        weatherNotSet: 'not set (or WEATHER_LAT and WEATHER_LON)',
+        url: 'not a valid http(s) URL', locale: 'not a valid locale (e.g. en-GB)',
+        oneOf: (a) => `must be ${a.map((v) => `"${v}"`).join(' or ')}`,
+        pair: 'missing (WEATHER_LAT and WEATHER_LON go together)', range: (m) => `must be a number between -${m} and ${m}`,
+        place: (p) => `place "${p}" not found`,
+        calendars: (u, all) => `not found: ${u.join(', ')} (available: ${all.join(', ')})`,
+      },
+      hint: 'Check the configuration (e.g. .envrc). The next run will try again automatically.',
+    },
     empty: 'Nothing here', noLists: 'No reminder lists found', untitled: '(untitled)',
     allDay: 'All day',
     greet: ['Good night', 'Good morning', 'Good afternoon', 'Good evening'],
@@ -96,6 +133,59 @@ const STRINGS = {
   },
 };
 const T = STRINGS[LOCALE.split(/[-_]/)[0].toLowerCase()] ?? STRINGS.en;
+
+// ---------------------------------------------------------------- Config ----
+
+// A setting that is missing or has an unusable value. Collected problems are
+// shown together on the error screen.
+class ConfigError extends Error {
+  constructor(problems) {
+    super(`Configuration problem: ${problems.map((p) => `${p.name} (${p.reason})`).join('; ')}`);
+    this.problems = problems;
+  }
+}
+
+// Check every setting up front, so all problems show at once instead of one per run.
+function validateConfig({ demo, toFile }) {
+  const R = T.error.reasons;
+  const env = (name) => process.env[name]?.trim() || '';
+  const problems = [];
+  const isHttpUrl = (v) => { try { return /^https?:$/.test(new URL(v).protocol); } catch { return false; } };
+
+  if (!demo) {
+    for (const name of ['CALDAV_URL', 'CALDAV_USER', 'CALDAV_PASSWORD', 'GREETING_NAME']) {
+      if (!env(name)) problems.push({ name, reason: R.notSet });
+    }
+    if (!env('WEATHER_LOCATION') && !(env('WEATHER_LAT') || env('WEATHER_LON'))) {
+      problems.push({ name: 'WEATHER_LOCATION', reason: R.weatherNotSet });
+    }
+    // Without an output file on the command line the board goes to the webhook.
+    if (!toFile && !env('WEBHOOK_URL')) problems.push({ name: 'WEBHOOK_URL', reason: R.webhookNotSet });
+  }
+  if (env('CALDAV_URL') && !isHttpUrl(env('CALDAV_URL'))) problems.push({ name: 'CALDAV_URL', reason: R.url });
+  if (env('WEBHOOK_URL') && !isHttpUrl(env('WEBHOOK_URL'))) problems.push({ name: 'WEBHOOK_URL', reason: R.url });
+
+  if (env('WEATHER_LAT') || env('WEATHER_LON')) {
+    for (const [name, max] of [['WEATHER_LAT', 90], ['WEATHER_LON', 180]]) {
+      const v = env(name);
+      if (!v) problems.push({ name, reason: R.pair });
+      else if (!/^-?\d+(\.\d+)?$/.test(v) || Math.abs(Number(v)) > max) problems.push({ name, reason: R.range(max) });
+    }
+  }
+
+  if (env('LOCALE')) {
+    try { Intl.getCanonicalLocales(env('LOCALE')); } catch { problems.push({ name: 'LOCALE', reason: R.locale }); }
+  }
+  const oneOf = (name, allowed) => {
+    const v = env(name);
+    if (v && !allowed.includes(v.toLowerCase())) problems.push({ name, reason: R.oneOf(allowed) });
+  };
+  oneOf('GROUP_BY', ['status', 'list']);
+  oneOf('SHOW_COMPLETED', ['0', '1']);
+  oneOf('SHOW_EVENTS', ['0', '1']);
+
+  if (problems.length) throw new ConfigError(problems);
+}
 
 // ---------------------------------------------------------------- CalDAV ----
 
@@ -209,8 +299,9 @@ async function discoverEventCalendars(homeUrl) {
 <d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
   <d:prop><d:resourcetype/><d:displayname/><c:supported-calendar-component-set/></d:prop>
 </d:propfind>`);
-  const only = process.env.EVENT_CALENDARS?.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-  const cals = [];
+  const wanted = process.env.EVENT_CALENDARS?.split(',').map((s) => s.trim()).filter(Boolean);
+  const only = wanted?.map((s) => s.toLowerCase());
+  const cals = [], seen = [];
   for (const r of responses) {
     const prop = okProp(r);
     const rt = prop.resourcetype;
@@ -219,8 +310,13 @@ async function discoverEventCalendars(homeUrl) {
     if (comps && !comps.some((c) => c['@_name'] === 'VEVENT')) continue;
     const url = new URL(r.href, homeUrl).toString();
     const name = text(prop.displayname) || decodeURIComponent(url.replace(/\/$/, '').split('/').pop());
+    seen.push(name);
     if (only && !only.includes(name.toLowerCase())) continue;
     cals.push({ url, name });
+  }
+  const unknown = wanted?.filter((n) => !seen.some((s) => s.toLowerCase() === n.toLowerCase())) ?? [];
+  if (unknown.length) {
+    throw new ConfigError([{ name: 'EVENT_CALENDARS', reason: T.error.reasons.calendars(unknown, seen) }]);
   }
   return cals;
 }
@@ -269,20 +365,11 @@ async function loadUpcomingEvents() {
   start.setHours(0, 0, 0, 0);
   const end = new Date(start);
   end.setDate(end.getDate() + 2);
-  try {
-    const cals = await discoverEventCalendars(await discoverCalendarHome(process.env.CALDAV_URL));
-    const results = await Promise.all(
-      cals.map((cal) => fetchEvents(cal, start, end).catch((err) => {
-        console.error(`Skipping calendar "${cal.name}": ${err.message}`);
-        return [];
-      })),
-    );
-    return results.flat();
-  } catch (err) {
-    // Events are an extra; never let them break the reminders board.
-    console.error(`Could not load calendar events: ${err.message}`);
-    return [];
-  }
+  const cals = await discoverEventCalendars(await discoverCalendarHome(process.env.CALDAV_URL));
+  const results = await Promise.all(cals.map((cal) => fetchEvents(cal, start, end).catch((err) => {
+    throw new Error(`${T.error.calendar(cal.name)}: ${describeError(err)}`, { cause: err });
+  })));
+  return results.flat();
 }
 
 // --------------------------------------------------------------- Weather ----
@@ -293,12 +380,14 @@ async function loadUpcomingEvents() {
 async function loadWeather() {
   let lat = process.env.WEATHER_LAT, lon = process.env.WEATHER_LON;
   const place = process.env.WEATHER_LOCATION;
-  if (!(lat && lon) && !place) return null;
+  if (!(lat && lon) && !place) return null; // only in --demo; validateConfig requires a location otherwise
   try {
     if (!(lat && lon)) {
       const url = `https://geocoding-api.open-meteo.com/v1/search?count=1&name=${encodeURIComponent(place)}`;
-      const hit = (await (await fetch(url)).json()).results?.[0];
-      if (!hit) throw new Error(`location "${place}" not found`);
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`geocoding -> ${res.status} ${res.statusText}`);
+      const hit = (await res.json()).results?.[0];
+      if (!hit) throw new ConfigError([{ name: 'WEATHER_LOCATION', reason: T.error.reasons.place(place) }]);
       ({ latitude: lat, longitude: lon } = hit);
     }
     const daily = [
@@ -324,9 +413,8 @@ async function loadWeather() {
       uv: d.uv_index_max[i],
     }));
   } catch (err) {
-    // Weather is an extra; never let it break the board.
-    console.error(`Could not load weather: ${err.message}`);
-    return null;
+    if (err instanceof ConfigError) throw err;
+    throw new Error(`${T.error.weather}: ${describeError(err)}`, { cause: err });
   }
 }
 
@@ -918,6 +1006,78 @@ function encodeMonoPng(canvas) {
   ]);
 }
 
+// Human-readable message, including the underlying cause of network errors
+// (fetch only says "fetch failed" and hides e.g. ENOTFOUND in err.cause).
+function describeError(err) {
+  const cause = err?.cause?.message || err?.cause?.code;
+  const msg = err?.message || String(err);
+  return cause && !msg.includes(cause) ? `${msg} (${cause})` : msg;
+}
+
+// Full-screen error card, so the display shows what went wrong instead of a
+// stale board.
+function renderError(err, font) {
+  const canvas = createCanvas(WIDTH, HEIGHT);
+  const ctx = canvas.getContext('2d');
+  const BLACK = '#000', WHITE = '#fff', M = 20;
+  ctx.textBaseline = 'alphabetic';
+  const drawText = (str, x, y) => ctx.fillText(str, x, y + ctx.measureText('Hg').fontBoundingBoxAscent);
+
+  ctx.fillStyle = WHITE;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  ctx.fillStyle = BLACK;
+  ctx.fillRect(0, 0, WIDTH, 34);
+  ctx.fillStyle = WHITE;
+  ctx.font = `bold 20px ${font}`;
+  drawText(T.error.header, 10, 7);
+  let stamp;
+  try {
+    stamp = new Date().toLocaleString(LOCALE, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  } catch {
+    const d = new Date(), p = (n) => String(n).padStart(2, '0'); // e.g. invalid LOCALE: plain local time
+    stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+  ctx.font = `15px ${font}`;
+  drawText(stamp, WIDTH - 10 - ctx.measureText(stamp).width, 10);
+
+  ctx.fillStyle = BLACK;
+  ctx.font = `64px ${font}`;
+  drawText('⚠️', M, 60);
+  const tx = M + 96, tw = WIDTH - tx - M;
+  let y = 64;
+  ctx.font = `bold 24px ${font}`;
+  drawText(err instanceof ConfigError ? T.error.configTitle : T.error.title, tx, y);
+  y += 42;
+
+  if (err instanceof ConfigError) {
+    ctx.font = `16px ${font}`;
+    drawText(T.error.configIntro, tx, y);
+    y += 30;
+    // "• NAME" in bold, the reason wrapped beside it.
+    for (const { name, reason } of err.problems) {
+      if (y > HEIGHT - 80) break;
+      ctx.font = `bold 16px ${font}`;
+      const label = `•  ${name}`;
+      drawText(label, tx + 4, y);
+      const rx = tx + 4 + ctx.measureText(label).width + 10;
+      ctx.font = `15px ${font}`;
+      const lines = wrap(ctx, `– ${reason}`, WIDTH - M - rx, 3);
+      lines.forEach((ln, i) => drawText(ln, rx, y + 1 + i * 19));
+      y += Math.max(1, lines.length) * 19 + 10;
+    }
+  } else {
+    ctx.font = `16px ${font}`;
+    for (const line of wrap(ctx, describeError(err), tw, 12)) {
+      drawText(line, tx, y);
+      y += 22;
+    }
+  }
+
+  ctx.font = `bold 13px ${font}`;
+  for (const [i, line] of wrap(ctx, T.error.hint, WIDTH - 2 * M, 2).entries()) drawText(line, M, HEIGHT - 44 + i * 17);
+  return canvas;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (args.includes('--dump')) return dumpReminders();
@@ -928,25 +1088,40 @@ async function main() {
   const useWebhook = webhook && !outArg;
   const out = outArg || (useWebhook ? null : 'reminders.png');
 
-  const data = demo ? demoReminders() : await loadReminders();
-  const canvas = render(buildColumns(data), registerFonts(), GROUP_BY_LIST() ? null : subtitle(daySummary(data)));
-  const png = encodeMonoPng(canvas);
+  // Any failure while building the board becomes an error image that is
+  // delivered like the board itself; the process still exits non-zero.
+  let font = 'sans-serif', png, failed = false;
+  try {
+    font = registerFonts();
+    validateConfig({ demo, toFile: Boolean(outArg) });
+    const data = demo ? demoReminders() : await loadReminders();
+    png = encodeMonoPng(render(buildColumns(data), font, GROUP_BY_LIST() ? null : subtitle(daySummary(data))));
+    console.log(`Rendered board (${WIDTH}x${HEIGHT}, ${data.todos.length} reminders, ${data.events?.length ?? 0} events today/tomorrow)`);
+  } catch (err) {
+    console.error(`Error: ${describeError(err)}`);
+    png = encodeMonoPng(renderError(err, font));
+    failed = true;
+  }
 
   if (out) {
     writeFileSync(out, png);
-    console.log(`Wrote ${out} (${WIDTH}x${HEIGHT}, ${data.todos.length} reminders, ${data.events?.length ?? 0} events today/tomorrow)`);
+    console.log(`Wrote ${out}${failed ? ' (error image)' : ''}`);
   }
   if (useWebhook) await postWebhook(webhook, png);
+  if (failed) process.exitCode = 1;
 }
 
-// POST the PNG to WEBHOOK_URL as the raw request body.
+// POST the PNG to WEBHOOK_URL as the raw request body. Only the host is logged,
+// since webhook URLs usually contain a secret token.
 async function postWebhook(url, image) {
+  const host = new URL(url).host;
   const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'image/png' }, body: image });
-  if (!res.ok) throw new Error(`Webhook POST ${url} -> ${res.status} ${res.statusText}: ${(await res.text()).slice(0, 200)}`);
-  console.log(`Posted image to ${new URL(url).host} (${res.status})`);
+  if (!res.ok) throw new Error(`Webhook POST to ${host} -> ${res.status} ${res.statusText}: ${(await res.text()).slice(0, 200)}`);
+  console.log(`Posted image to ${host} (${res.status})`);
 }
 
 main().catch((err) => {
-  console.error(err.message);
+  // Only reached when the image itself could not be delivered.
+  console.error(describeError(err));
   process.exit(1);
 });
