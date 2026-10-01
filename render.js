@@ -25,7 +25,7 @@
 //   WEATHER_LOCATION place name for the weather line in Heute/Morgen, e.g. "Hamburg" (required)
 //   WEATHER_LAT/LON  coordinates instead of WEATHER_LOCATION
 //                    The forecast is cached in the temp dir; if the weather service fails, a
-//                    cached forecast up to 1 hour old is shown instead of the error image.
+//                    cached forecast up to 6 hours old is shown instead of the error image.
 //   WEBHOOK_URL      POST the rendered PNG to this URL (raw body, image/png); required
 //                    unless an output file is given on the command line
 //
@@ -394,7 +394,7 @@ async function loadUpcomingEvents() {
 // Every successful lookup is cached in the temp dir. If a later lookup fails,
 // a cache younger than WEATHER_CACHE_MAX_AGE is used instead of failing.
 const WEATHER_CACHE = join(tmpdir(), 'webdav-reminders-trmnl-weather.json');
-const WEATHER_CACHE_MAX_AGE = 60 * 60 * 1000;
+const WEATHER_CACHE_MAX_AGE = 6 * 60 * 60 * 1000;
 
 async function loadWeather() {
   const lat = process.env.WEATHER_LAT, lon = process.env.WEATHER_LON;
