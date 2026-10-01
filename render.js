@@ -24,6 +24,8 @@
 //   GREETING_NAME    name for the header greeting, e.g. "Daniel" -> "Guten Morgen, Daniel" (required)
 //   WEATHER_LOCATION place name for the weather line in Heute/Morgen, e.g. "Hamburg" (required)
 //   WEATHER_LAT/LON  coordinates instead of WEATHER_LOCATION
+//                    The forecast is cached in the temp dir; if the weather service fails, a
+//                    cached forecast up to 6 hours old is shown instead of the error image.
 //   WEBHOOK_URL      POST the rendered PNG to this URL (raw body, image/png); required
 //                    unless an output file is given on the command line
 //
@@ -36,7 +38,8 @@
 import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
 import { XMLParser } from 'fast-xml-parser';
 import ICAL from 'ical.js';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { crc32, deflateSync } from 'node:zlib';
@@ -387,45 +390,94 @@ async function loadUpcomingEvents() {
 // Daily forecast for today and tomorrow from Open-Meteo (free, no API key).
 // Location: WEATHER_LAT + WEATHER_LON, or WEATHER_LOCATION (a place name that
 // is geocoded). Without either, the board shows no weather.
+//
+// Every successful lookup is cached in the temp dir. If a later lookup fails,
+// a cache younger than WEATHER_CACHE_MAX_AGE is used instead of failing.
+const WEATHER_CACHE = join(tmpdir(), 'webdav-reminders-trmnl-weather.json');
+const WEATHER_CACHE_MAX_AGE = 6 * 60 * 60 * 1000;
+
 async function loadWeather() {
-  let lat = process.env.WEATHER_LAT, lon = process.env.WEATHER_LON;
+  const lat = process.env.WEATHER_LAT, lon = process.env.WEATHER_LON;
   const place = process.env.WEATHER_LOCATION;
   if (!(lat && lon) && !place) return null; // only in --demo; validateConfig requires a location otherwise
+  const key = lat && lon ? `${lat},${lon}` : place;
   try {
-    if (!(lat && lon)) {
-      const url = `https://geocoding-api.open-meteo.com/v1/search?count=1&name=${encodeURIComponent(place)}`;
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`geocoding -> ${res.status} ${res.statusText}`);
-      const hit = (await res.json()).results?.[0];
-      if (!hit) throw new ConfigError([{ name: 'WEATHER_LOCATION', reason: T.error.reasons.place(place) }]);
-      ({ latitude: lat, longitude: lon } = hit);
-    }
-    const daily = [
-      'weather_code', 'temperature_2m_max', 'temperature_2m_min', 'apparent_temperature_max',
-      'apparent_temperature_min', 'precipitation_sum', 'precipitation_probability_max',
-      'snowfall_sum', 'wind_gusts_10m_max', 'uv_index_max',
-    ];
-    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
-      + `&daily=${daily.join(',')}&timezone=auto&forecast_days=2`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`forecast -> ${res.status} ${res.statusText}`);
-    const d = (await res.json()).daily;
-    return [0, 1].map((i) => ({
-      code: d.weather_code[i],
-      min: d.temperature_2m_min[i],
-      max: d.temperature_2m_max[i],
-      feelsMin: d.apparent_temperature_min[i],
-      feelsMax: d.apparent_temperature_max[i],
-      rain: d.precipitation_sum[i],
-      rainChance: d.precipitation_probability_max[i],
-      snow: d.snowfall_sum[i],
-      gusts: d.wind_gusts_10m_max[i],
-      uv: d.uv_index_max[i],
-    }));
+    const days = await fetchForecast(lat, lon, place);
+    writeWeatherCache(key, days);
+    return days.slice(0, 2);
   } catch (err) {
     if (err instanceof ConfigError) throw err;
+    const cached = readWeatherCache(key);
+    if (cached) {
+      console.warn(`${T.error.weather}: ${describeError(err)} (using cached forecast)`);
+      return cached;
+    }
     throw new Error(`${T.error.weather}: ${describeError(err)}`, { cause: err });
   }
+}
+
+// Returns three days (so a cached forecast from yesterday evening still covers
+// today and tomorrow), each tagged with its date (YYYY-MM-DD).
+async function fetchForecast(lat, lon, place) {
+  if (!(lat && lon)) {
+    const url = `https://geocoding-api.open-meteo.com/v1/search?count=1&name=${encodeURIComponent(place)}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`geocoding -> ${res.status} ${res.statusText}`);
+    const hit = (await res.json()).results?.[0];
+    if (!hit) throw new ConfigError([{ name: 'WEATHER_LOCATION', reason: T.error.reasons.place(place) }]);
+    ({ latitude: lat, longitude: lon } = hit);
+  }
+  const daily = [
+    'weather_code', 'temperature_2m_max', 'temperature_2m_min', 'apparent_temperature_max',
+    'apparent_temperature_min', 'precipitation_sum', 'precipitation_probability_max',
+    'snowfall_sum', 'wind_gusts_10m_max', 'uv_index_max',
+  ];
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
+    + `&daily=${daily.join(',')}&timezone=auto&forecast_days=3`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`forecast -> ${res.status} ${res.statusText}`);
+  const d = (await res.json()).daily;
+  return [0, 1, 2].map((i) => ({
+    date: d.time[i],
+    code: d.weather_code[i],
+    min: d.temperature_2m_min[i],
+    max: d.temperature_2m_max[i],
+    feelsMin: d.apparent_temperature_min[i],
+    feelsMax: d.apparent_temperature_max[i],
+    rain: d.precipitation_sum[i],
+    rainChance: d.precipitation_probability_max[i],
+    snow: d.snowfall_sum[i],
+    gusts: d.wind_gusts_10m_max[i],
+    uv: d.uv_index_max[i],
+  }));
+}
+
+// Best effort: a cache that cannot be written only means no fallback next time.
+function writeWeatherCache(key, days) {
+  try {
+    const tmp = `${WEATHER_CACHE}.${process.pid}`;
+    writeFileSync(tmp, JSON.stringify({ key, fetchedAt: Date.now(), days }));
+    renameSync(tmp, WEATHER_CACHE);
+  } catch (err) {
+    console.warn(`Could not write weather cache ${WEATHER_CACHE}: ${describeError(err)}`);
+  }
+}
+
+// Today and tomorrow from the cache, or null if it is missing, older than
+// WEATHER_CACHE_MAX_AGE, for another location, or does not cover today.
+function readWeatherCache(key) {
+  let cache;
+  try {
+    cache = JSON.parse(readFileSync(WEATHER_CACHE, 'utf8'));
+  } catch {
+    return null;
+  }
+  const age = Date.now() - cache.fetchedAt;
+  if (cache.key !== key || !(age >= 0 && age < WEATHER_CACHE_MAX_AGE) || !Array.isArray(cache.days)) return null;
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const i = cache.days.findIndex((day) => day.date === today);
+  return i < 0 ? null : [cache.days[i], cache.days[i + 1] ?? null];
 }
 
 // WMO weather code -> emoji (drawn in black and white by the Noto Emoji font).
