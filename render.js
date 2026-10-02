@@ -264,26 +264,78 @@ function hasLocation(vtodo) {
   );
 }
 
+const isCompleted = (vtodo) => (vtodo.getFirstPropertyValue('status') || '').toUpperCase() === 'COMPLETED'
+  || vtodo.hasProperty('completed');
+
+function toTodo(vtodo, list) {
+  const due = vtodo.getFirstPropertyValue('due');
+  const status = (vtodo.getFirstPropertyValue('status') || '').toUpperCase();
+  const completed = isCompleted(vtodo);
+  // COMPLETED holds the completion time; clients that leave it out still bump
+  // LAST-MODIFIED (or DTSTAMP) when the reminder is ticked off.
+  const completedAt = vtodo.getFirstPropertyValue('completed')
+    ?? (completed ? vtodo.getFirstPropertyValue('last-modified') ?? vtodo.getFirstPropertyValue('dtstamp') : null);
+  return {
+    title: cleanTitle(vtodo.getFirstPropertyValue('summary')),
+    list: list.name,
+    status: completed ? 'COMPLETED' : status === 'IN-PROCESS' ? 'IN-PROCESS' : 'NEEDS-ACTION',
+    due: due ? due.toJSDate() : null,
+    dueHasTime: due ? !due.isDate : false,
+    priority: Number(vtodo.getFirstPropertyValue('priority')) || 0, // 1 = highest, 0 = none
+    completedAt: completedAt?.toJSDate() ?? null,
+    recurring: vtodo.hasProperty('rrule'),
+  };
+}
+
+// Due date of the first occurrence of a recurring reminder that is neither
+// completed (its RECURRENCE-ID start time is in `done`) nor excluded by EXDATE;
+// null once every occurrence is done.
+function nextOpenDue(vtodo, done) {
+  const due = vtodo.getFirstPropertyValue('due');
+  const start = vtodo.getFirstPropertyValue('dtstart') ?? due;
+  const offset = due.toJSDate() - start.toJSDate();
+  const skip = new Set(done);
+  for (const prop of vtodo.getAllProperties('exdate')) {
+    for (const t of prop.getValues()) skip.add(t.toJSDate().getTime());
+  }
+  const it = vtodo.getFirstPropertyValue('rrule').iterator(start);
+  // Each occurrence is either skipped or the answer, so this ends after at most skip.size + 1 steps.
+  for (let t = it.next(); t; t = it.next()) {
+    const ms = t.toJSDate().getTime();
+    if (!skip.has(ms)) return new Date(ms + offset);
+  }
+  return null;
+}
+
 async function fetchTodos(list) {
   const todos = [];
   for (const data of await fetchCalendarData(list)) {
     const vcal = new ICAL.Component(ICAL.parse(data));
-    for (const vtodo of vcal.getAllSubcomponents('vtodo')) {
-      if (vtodo.hasProperty('recurrence-id')) continue; // skip overridden instances
-      if (hasLocation(vtodo)) continue; // location-triggered reminders don't belong on the board
-      const due = vtodo.getFirstPropertyValue('due');
-      const status = (vtodo.getFirstPropertyValue('status') || '').toUpperCase();
-      const completed = status === 'COMPLETED' || vtodo.hasProperty('completed');
-      todos.push({
-        title: cleanTitle(vtodo.getFirstPropertyValue('summary')),
-        list: list.name,
-        status: completed ? 'COMPLETED' : status === 'IN-PROCESS' ? 'IN-PROCESS' : 'NEEDS-ACTION',
-        due: due ? due.toJSDate() : null,
-        dueHasTime: due ? !due.isDate : false,
-        priority: Number(vtodo.getFirstPropertyValue('priority')) || 0, // 1 = highest, 0 = none
-        completedAt: vtodo.getFirstPropertyValue('completed')?.toJSDate() ?? null,
-        recurring: vtodo.hasProperty('rrule'),
-      });
+    // location-triggered reminders don't belong on the board
+    const vtodos = vcal.getAllSubcomponents('vtodo').filter((vtodo) => !hasLocation(vtodo));
+    // Some clients tick off one occurrence of a recurring reminder by adding an
+    // override (same UID plus RECURRENCE-ID) marked completed, instead of moving
+    // the reminder's due date. Such an override counts as done today if it was
+    // completed today, and the reminder moves on to its next open occurrence.
+    const doneOccurrences = new Map(); // UID -> start times of completed occurrences
+    for (const vtodo of vtodos) {
+      if (!vtodo.hasProperty('recurrence-id') || !isCompleted(vtodo)) continue;
+      const uid = vtodo.getFirstPropertyValue('uid');
+      if (!doneOccurrences.has(uid)) doneOccurrences.set(uid, []);
+      doneOccurrences.get(uid).push(vtodo.getFirstPropertyValue('recurrence-id').toJSDate().getTime());
+    }
+    for (const vtodo of vtodos) {
+      if (vtodo.hasProperty('recurrence-id')) {
+        if (isCompleted(vtodo)) todos.push(toTodo(vtodo, list));
+        continue; // open overrides: the reminder itself stands for the series
+      }
+      const todo = toTodo(vtodo, list);
+      const done = doneOccurrences.get(vtodo.getFirstPropertyValue('uid'));
+      if (done && todo.recurring && todo.due && todo.status !== 'COMPLETED') {
+        todo.due = nextOpenDue(vtodo, done);
+        if (!todo.due) continue; // every occurrence done; the overrides are listed above
+      }
+      todos.push(todo);
     }
   }
   return todos;
